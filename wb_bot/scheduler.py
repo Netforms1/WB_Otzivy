@@ -84,17 +84,30 @@ async def _process_user(
             log.warning("Gemini failed: %s", e)
             continue
 
+        # Сразу сохраняем сгенерированное в БД, чтобы не потерять при сбое отправки
+        await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
+
         if u["auto_send"]:
             # Полный авто-режим: сразу шлём ответ на WB
             try:
                 await wb.answer(fb_id, answer)
             except WBRateLimited:
-                log.info("user %s: WB лимит на answer, прервал цикл", user_id)
+                log.info("user %s: WB лимит на answer — отзыв в 'Открыть сохранённые'", user_id)
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "⚠️ WB на cooldown — авто-отправка не удалась.\n"
+                        "Отзыв сохранён, нажми <b>📂 Открыть сохранённые</b> когда лимит снимется.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
                 break
             except WBError as e:
                 log.warning("WB answer failed user=%s: %s", user_id, e)
                 continue
             await db.mark_answered(user_id, fb_id)
+            await db.delete_notified(user_id, fb_id)
             rating = fb.get("productValuation") or 0
             stars = "⭐" * rating + "☆" * (5 - rating)
             short_text = (fb.get("text") or "")[:120]
@@ -122,7 +135,6 @@ async def _process_user(
             except Exception:
                 log.exception("Не удалось отправить пуш-сообщение user=%s", user_id)
                 continue
-            await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
             stats["pushed"] += 1
         await asyncio.sleep(1.5)
 
