@@ -188,12 +188,45 @@ async def cb_check_now(
         return
     await cq.answer("Проверяю WB...", show_alert=False)
     from .scheduler import run_user_check
-    pushed = await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
-    if pushed == 0:
+    stats = await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
+
+    if stats.get("error"):
         await cq.bot.send_message(
-            cq.from_user.id,
-            "📭 Новых отзывов нет (или все уже были показаны/отвечены).",
+            cq.from_user.id, f"⚠️ Ошибка: {html.escape(stats['error'])}"
         )
+        return
+
+    if stats["pushed"] == 0:
+        rating_label = dict(RATING_FILTERS).get(u["answer_rating"], u["answer_rating"])
+        report = (
+            "📊 <b>Результат проверки WB:</b>\n"
+            f"• Неотвеченных в WB: <b>{stats['total']}</b>\n"
+            f"• Отрезано фильтром «{html.escape(rating_label)}»: {stats['filtered_out']}\n"
+            f"• Уже показывал ранее: {stats['already_seen']}\n"
+            f"• Новых для показа: <b>0</b>\n\n"
+        )
+        if stats["total"] == 0:
+            report += "В WB нет неотвеченных отзывов."
+        elif stats["already_seen"] > 0:
+            report += (
+                "Все отзывы уже показывались. Нажми <b>🗑 Сбросить историю показов</b>, "
+                "чтобы прислать их заново."
+            )
+        elif stats["filtered_out"] > 0:
+            report += "Все отрезал фильтр оценок. Поменяй его в меню."
+        await cq.bot.send_message(cq.from_user.id, report, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "reset_notified")
+async def cb_reset_notified(cq: CallbackQuery, db: DB) -> None:
+    import aiosqlite
+    async with aiosqlite.connect(db.path) as conn:
+        cur = await conn.execute(
+            "DELETE FROM notified WHERE user_id = ?", (cq.from_user.id,)
+        )
+        await conn.commit()
+        deleted = cur.rowcount
+    await cq.answer(f"Сброшено: {deleted}", show_alert=True)
 
 
 # --------------------- Выбор тона / стиля / фильтра ---------------------

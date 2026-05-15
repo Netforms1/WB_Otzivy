@@ -36,7 +36,8 @@ def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
     token_label = "🔑 WB-токен: задан ✅" if has_token else "🔑 Задать WB-токен"
     b.button(text=token_label, callback_data="set_token")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
-    b.adjust(1, 1, 1, 2, 1, 1, 1, 1)
+    b.button(text="🗑 Сбросить историю показов", callback_data="reset_notified")
+    b.adjust(1, 1, 1, 2, 1, 1, 1, 1, 1)
     return b.as_markup()
 
 

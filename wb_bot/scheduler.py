@@ -31,26 +31,31 @@ async def auto_answer_cycle(
 
 async def _process_user(
     bot: Bot, db: DB, gemini: GeminiClient, settings: Settings, u: dict
-) -> int:
+) -> dict:
     user_id = u["user_id"]
+    stats = {"total": 0, "filtered_out": 0, "already_seen": 0, "pushed": 0, "error": None}
     wb = WBClient(u["wb_token"])
     try:
         raw = await wb.get_unanswered(take=settings.batch_size)
-    except WBRateLimited:
+    except WBRateLimited as e:
         log.info("user %s: WB лимит, пропускаем цикл", user_id)
-        return 0
+        stats["error"] = f"rate_limit: {e}"
+        return stats
     except WBError as e:
         log.warning("WB error for user %s: %s", user_id, e)
-        return 0
+        stats["error"] = str(e)
+        return stats
 
+    stats["total"] = len(raw)
     feedbacks = _filter_by_rating(raw, u["answer_rating"])
+    stats["filtered_out"] = len(raw) - len(feedbacks)
     if not feedbacks:
-        return 0
+        return stats
 
-    pushed = 0
     for fb in feedbacks:
         fb_id = fb["id"]
         if await db.is_answered(user_id, fb_id) or await db.is_notified(user_id, fb_id):
+            stats["already_seen"] += 1
             continue
 
         try:
@@ -78,12 +83,12 @@ async def _process_user(
             continue
 
         await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
-        pushed += 1
-        await asyncio.sleep(1.5)  # мягкий троттлинг
+        stats["pushed"] += 1
+        await asyncio.sleep(1.5)
 
-    if pushed:
-        log.info("Авто-показ: пользователю %s выслано %d новых отзывов", user_id, pushed)
-    return pushed
+    if stats["pushed"]:
+        log.info("Авто-показ: user=%s pushed=%d", user_id, stats["pushed"])
+    return stats
 
 
 def setup_scheduler(
@@ -106,13 +111,13 @@ def setup_scheduler(
 
 async def run_user_check(
     bot: Bot, db: DB, gemini: GeminiClient, settings: Settings, user_id: int
-) -> int:
-    """Сразу проверить отзывы для одного пользователя. Возвращает кол-во пушей."""
+) -> dict:
+    """Сразу проверить отзывы. Возвращает статистику цикла."""
     u = await db.get_user(user_id)
     if not u or not u["wb_token"]:
-        return 0
+        return {"error": "no_token"}
     try:
         return await _process_user(bot, db, gemini, settings, u)
-    except Exception:
+    except Exception as e:
         log.exception("Manual check failed for user %s", user_id)
-        return 0
+        return {"error": str(e)}
