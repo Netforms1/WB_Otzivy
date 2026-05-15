@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import httpx
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"

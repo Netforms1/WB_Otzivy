@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import httpx
 
 BASE_URL = "https://feedbacks-api.wildberries.ru"
