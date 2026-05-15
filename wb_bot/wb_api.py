@@ -51,14 +51,18 @@ class WBClient:
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
             try:
-                wait = float(retry_after) if retry_after else 60.0
+                wait = float(retry_after) if retry_after else 300.0
             except ValueError:
-                wait = 60.0
-            wait = min(max(wait, 30.0), 300.0)
+                wait = 300.0
+            wait = min(max(wait, 120.0), 900.0)
             _cooldown_until[self.token] = time.monotonic() + wait
             log.info("WB 429, cooldown %.0f сек", wait)
             raise WBRateLimited(f"WB лимит: следующий запрос через {int(wait)} сек")
         return r
+
+    def cooldown_left(self) -> int:
+        left = _cooldown_until.get(self.token, 0.0) - time.monotonic()
+        return max(0, int(left))
 
     async def get_unanswered(self, take: int = 20, skip: int = 0) -> list[dict]:
         params = {"isAnswered": "false", "take": take, "skip": skip, "order": "dateDesc"}

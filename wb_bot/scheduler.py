@@ -35,6 +35,10 @@ async def _process_user(
     user_id = u["user_id"]
     stats = {"total": 0, "filtered_out": 0, "already_seen": 0, "pushed": 0, "error": None}
     wb = WBClient(u["wb_token"])
+    left = wb.cooldown_left()
+    if left > 0:
+        stats["error"] = f"rate_limit: ждём ещё {left} сек"
+        return stats
     try:
         raw = await wb.get_unanswered(take=settings.batch_size)
     except WBRateLimited as e:
