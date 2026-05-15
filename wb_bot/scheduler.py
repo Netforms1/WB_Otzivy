@@ -31,18 +31,18 @@ async def auto_answer_cycle(
 
 async def _process_user(
     bot: Bot, db: DB, gemini: GeminiClient, settings: Settings, u: dict
-) -> None:
+) -> int:
     user_id = u["user_id"]
     wb = WBClient(u["wb_token"])
     try:
         raw = await wb.get_unanswered(take=settings.batch_size)
     except WBError as e:
         log.warning("WB error for user %s: %s", user_id, e)
-        return
+        return 0
 
     feedbacks = _filter_by_rating(raw, u["answer_rating"])
     if not feedbacks:
-        return
+        return 0
 
     pushed = 0
     for fb in feedbacks:
@@ -80,11 +80,13 @@ async def _process_user(
 
     if pushed:
         log.info("Авто-показ: пользователю %s выслано %d новых отзывов", user_id, pushed)
+    return pushed
 
 
 def setup_scheduler(
     bot: Bot, db: DB, gemini: GeminiClient, settings: Settings
 ) -> AsyncIOScheduler:
+    from datetime import datetime, timezone
     sched = AsyncIOScheduler(timezone="UTC")
     sched.add_job(
         auto_answer_cycle,
@@ -94,5 +96,20 @@ def setup_scheduler(
         id="auto_answer",
         max_instances=1,
         coalesce=True,
+        next_run_time=datetime.now(timezone.utc),
     )
     return sched
+
+
+async def run_user_check(
+    bot: Bot, db: DB, gemini: GeminiClient, settings: Settings, user_id: int
+) -> int:
+    """Сразу проверить отзывы для одного пользователя. Возвращает кол-во пушей."""
+    u = await db.get_user(user_id)
+    if not u or not u["wb_token"]:
+        return 0
+    try:
+        return await _process_user(bot, db, gemini, settings, u)
+    except Exception:
+        log.exception("Manual check failed for user %s", user_id)
+        return 0

@@ -26,6 +26,7 @@ RATING_FILTERS = [
 def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📋 Показать новые отзывы", callback_data="show:0")
+    b.button(text="🔄 Проверить отзывы сейчас", callback_data="check_now")
     auto_label = "🟢 Авто-показ новых отзывов: ВКЛ" if auto_enabled else "⚪️ Авто-показ новых отзывов: ВЫКЛ"
     b.button(text=auto_label, callback_data="toggle_auto")
     b.button(text="🎭 Тон ответа", callback_data="menu:tone")
@@ -35,7 +36,7 @@ def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
     token_label = "🔑 WB-токен: задан ✅" if has_token else "🔑 Задать WB-токен"
     b.button(text=token_label, callback_data="set_token")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
-    b.adjust(1, 1, 2, 1, 1, 1, 1)
+    b.adjust(1, 1, 1, 2, 1, 1, 1, 1)
     return b.as_markup()
 
 

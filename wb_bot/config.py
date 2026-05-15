@@ -37,7 +37,7 @@ def load_settings() -> Settings:
         gemini_api_key=gemini_key,
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         admin_ids=_parse_admins(os.getenv("ADMIN_IDS", "")),
-        auto_interval_min=int(os.getenv("AUTO_INTERVAL_MIN", "5")),
+        auto_interval_min=int(os.getenv("AUTO_INTERVAL_MIN", "1")),
         batch_size=int(os.getenv("BATCH_SIZE", "20")),
         db_path=os.getenv("DB_PATH", "bot.db"),
     )

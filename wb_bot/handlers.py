@@ -157,7 +157,9 @@ async def cb_show_settings(cq: CallbackQuery, db: DB) -> None:
 
 
 @router.callback_query(F.data == "toggle_auto")
-async def cb_toggle_auto(cq: CallbackQuery, db: DB) -> None:
+async def cb_toggle_auto(
+    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
+) -> None:
     u = await db.get_user(cq.from_user.id)
     if not u["wb_token"]:
         await cq.answer("Сначала задайте WB-токен.", show_alert=True)
@@ -168,11 +170,30 @@ async def cb_toggle_auto(cq: CallbackQuery, db: DB) -> None:
     await cq.message.edit_reply_markup(
         reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]))
     )
-    await cq.answer(
-        "Авто-показ ВКЛЮЧЁН — новые отзывы будут приходить сюда сами"
-        if new_val else "Авто-показ выключен",
-        show_alert=True,
-    )
+    if new_val:
+        await cq.answer("Авто-показ ВКЛЮЧЁН — проверяю отзывы сейчас...", show_alert=False)
+        from .scheduler import run_user_check
+        await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
+    else:
+        await cq.answer("Авто-показ выключен")
+
+
+@router.callback_query(F.data == "check_now")
+async def cb_check_now(
+    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
+) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
+        return
+    await cq.answer("Проверяю WB...", show_alert=False)
+    from .scheduler import run_user_check
+    pushed = await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
+    if pushed == 0:
+        await cq.bot.send_message(
+            cq.from_user.id,
+            "📭 Новых отзывов нет (или все уже были показаны/отвечены).",
+        )
 
 
 # --------------------- Выбор тона / стиля / фильтра ---------------------
