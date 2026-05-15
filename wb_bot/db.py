@@ -134,6 +134,14 @@ class DB:
             )
             await db.commit()
 
+    async def count_answered(self, user_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM answered WHERE user_id = ?", (user_id,)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
     async def delete_notified(self, user_id: int, feedback_id: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(

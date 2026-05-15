@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# user_id -> {"total": int, "ts": datetime, "pushed": int}
+last_check: dict[int, dict] = {}
 
 from .config import Settings
 from .db import DB
@@ -51,6 +55,11 @@ async def _process_user(
         return stats
 
     stats["total"] = len(raw)
+    last_check[user_id] = {
+        "total": len(raw),
+        "ts": datetime.now(timezone.utc),
+        "pushed": 0,
+    }
     feedbacks = _filter_by_rating(raw, u["answer_rating"])
     stats["filtered_out"] = len(raw) - len(feedbacks)
     if not feedbacks:
@@ -90,6 +99,8 @@ async def _process_user(
         stats["pushed"] += 1
         await asyncio.sleep(1.5)
 
+    if user_id in last_check:
+        last_check[user_id]["pushed"] = stats["pushed"]
     if stats["pushed"]:
         log.info("Авто-показ: user=%s pushed=%d", user_id, stats["pushed"])
     return stats

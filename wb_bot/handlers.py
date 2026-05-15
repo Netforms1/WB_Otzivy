@@ -101,6 +101,32 @@ def format_push(fb: dict, generated: str) -> str:
     )
 
 
+async def _menu_text(db: DB, user_id: int) -> str:
+    from datetime import datetime, timezone
+    from .scheduler import last_check
+    from .wb_api import WBClient
+
+    u = await db.get_user(user_id)
+    answered = await db.count_answered(user_id)
+    info = last_check.get(user_id)
+
+    lines = ["🏠 <b>Главное меню</b>", ""]
+    if info:
+        ago_sec = (datetime.now(timezone.utc) - info["ts"]).total_seconds()
+        ago = f"{int(ago_sec // 60)} мин назад" if ago_sec >= 60 else f"{int(ago_sec)} сек назад"
+        lines.append(f"📬 Неотвечено в WB: <b>{info['total']}</b> (обновлено {ago})")
+    else:
+        lines.append("📬 Неотвечено в WB: <i>ещё не проверял</i>")
+    lines.append(f"✅ Ответил через бота: <b>{answered}</b>")
+
+    if u and u["wb_token"]:
+        wb = WBClient(u["wb_token"])
+        left = wb.cooldown_left()
+        if left:
+            lines.append(f"⏳ WB на cooldown: ~{left // 60 + 1} мин")
+    return "\n".join(lines)
+
+
 async def _settings_text(db: DB, user_id: int) -> str:
     u = await db.get_user(user_id)
     if not u:
@@ -125,9 +151,16 @@ async def _settings_text(db: DB, user_id: int) -> str:
 async def cmd_start(msg: Message, db: DB, settings: Settings) -> None:
     await db.ensure_user(msg.from_user.id)
     u = await db.get_user(msg.from_user.id)
+    if not u["wb_token"]:
+        await msg.answer(
+            "👋 Привет! Я — бот-автоответчик отзывов Wildberries на базе Gemini.\n\n"
+            "Для начала задай WB-токен через кнопку ниже.",
+            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"])),
+        )
+        return
     await msg.answer(
-        "👋 Привет! Я — бот-автоответчик отзывов Wildberries на базе Gemini.\n\n"
-        "Для начала задайте WB-токен через кнопку ниже. Управление полностью кнопками.",
+        await _menu_text(db, msg.from_user.id),
+        parse_mode="HTML",
         reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"])),
     )
 
@@ -139,7 +172,8 @@ async def cb_back_main(cq: CallbackQuery, db: DB, state: FSMContext) -> None:
     await state.clear()
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_text(
-        "🏠 Главное меню",
+        await _menu_text(db, cq.from_user.id),
+        parse_mode="HTML",
         reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"])),
     )
     await cq.answer()
@@ -185,6 +219,14 @@ async def cb_check_now(
     u = await db.get_user(cq.from_user.id)
     if not u["wb_token"]:
         await cq.answer("Сначала задайте WB-токен.", show_alert=True)
+        return
+    from .wb_api import WBClient
+    left = WBClient(u["wb_token"]).cooldown_left()
+    if left > 0:
+        await cq.answer(
+            f"WB на cooldown, осталось ~{left // 60 + 1} мин. Подожди — авто-цикл сам всё сделает.",
+            show_alert=True,
+        )
         return
     await cq.answer("Проверяю WB...", show_alert=False)
     from .scheduler import run_user_check
