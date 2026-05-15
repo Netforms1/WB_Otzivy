@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import Bot
@@ -68,6 +69,8 @@ async def _process_user(
 
         await db.mark_answered(user_id, fb_id)
         sent += 1
+        # Пауза между ответами, чтобы не упереться в rate-limit WB
+        await asyncio.sleep(1.5)
 
     if sent:
         await bot.send_message(
