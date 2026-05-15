@@ -84,19 +84,46 @@ async def _process_user(
             log.warning("Gemini failed: %s", e)
             continue
 
-        try:
-            await bot.send_message(
-                user_id,
-                format_push(fb, answer),
-                parse_mode="HTML",
-                reply_markup=push_feedback_kb(fb_id),
-            )
-        except Exception:
-            log.exception("Не удалось отправить пуш-сообщение user=%s", user_id)
-            continue
-
-        await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
-        stats["pushed"] += 1
+        if u["auto_send"]:
+            # Полный авто-режим: сразу шлём ответ на WB
+            try:
+                await wb.answer(fb_id, answer)
+            except WBRateLimited:
+                log.info("user %s: WB лимит на answer, прервал цикл", user_id)
+                break
+            except WBError as e:
+                log.warning("WB answer failed user=%s: %s", user_id, e)
+                continue
+            await db.mark_answered(user_id, fb_id)
+            rating = fb.get("productValuation") or 0
+            stars = "⭐" * rating + "☆" * (5 - rating)
+            short_text = (fb.get("text") or "")[:120]
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⚡ <b>Авто-ответ отправлен</b>\n"
+                    f"{stars} от <i>{fb.get('userName') or 'покупатель'}</i>\n"
+                    f"<i>{short_text}</i>\n\n"
+                    f"💬 {answer[:300]}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            stats["pushed"] += 1
+        else:
+            # Авто-показ: присылаем в чат с кнопками
+            try:
+                await bot.send_message(
+                    user_id,
+                    format_push(fb, answer),
+                    parse_mode="HTML",
+                    reply_markup=push_feedback_kb(fb_id),
+                )
+            except Exception:
+                log.exception("Не удалось отправить пуш-сообщение user=%s", user_id)
+                continue
+            await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
+            stats["pushed"] += 1
         await asyncio.sleep(1.5)
 
     if user_id in last_check:

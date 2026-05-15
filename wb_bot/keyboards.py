@@ -23,14 +23,21 @@ RATING_FILTERS = [
 ]
 
 
-def main_menu(auto_enabled: bool, has_token: bool, pending: int = 0) -> InlineKeyboardMarkup:
+def main_menu(
+    auto_enabled: bool,
+    has_token: bool,
+    pending: int = 0,
+    auto_send: bool = False,
+) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if pending > 0:
         b.button(text=f"📂 Открыть сохранённые ({pending})", callback_data="open_saved")
     b.button(text="📋 Показать новые отзывы", callback_data="show:0")
     b.button(text="🔄 Проверить отзывы сейчас", callback_data="check_now")
-    auto_label = "🟢 Авто-показ новых отзывов: ВКЛ" if auto_enabled else "⚪️ Авто-показ новых отзывов: ВЫКЛ"
+    auto_label = "🟢 Авто-показ в чат: ВКЛ" if auto_enabled else "⚪️ Авто-показ в чат: ВЫКЛ"
     b.button(text=auto_label, callback_data="toggle_auto")
+    send_label = "⚡ Авто-отправка на WB: ВКЛ" if auto_send else "🚫 Авто-отправка на WB: ВЫКЛ"
+    b.button(text=send_label, callback_data="toggle_send")
     b.button(text="🎭 Тон ответа", callback_data="menu:tone")
     b.button(text="🪶 Стиль ответа", callback_data="menu:style")
     b.button(text="🔍 Фильтр оценок", callback_data="menu:rating")
@@ -39,11 +46,11 @@ def main_menu(auto_enabled: bool, has_token: bool, pending: int = 0) -> InlineKe
     b.button(text=token_label, callback_data="set_token")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
     b.button(text="🗑 Сбросить историю показов", callback_data="reset_notified")
-    # Раскладка зависит от того, есть ли «сохранённые»
+    # Авто-показ и Авто-отправка — двумя кнопками в одну строку
     if pending > 0:
-        b.adjust(1, 1, 1, 1, 2, 1, 1, 1, 1, 1)
+        b.adjust(1, 1, 1, 2, 2, 1, 1, 1, 1, 1)
     else:
-        b.adjust(1, 1, 1, 2, 1, 1, 1, 1, 1)
+        b.adjust(1, 1, 2, 2, 1, 1, 1, 1, 1)
     return b.as_markup()
 
 

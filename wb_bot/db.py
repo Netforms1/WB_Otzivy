@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     style          TEXT NOT NULL DEFAULT 'medium',
     signature      TEXT,
     auto_enabled   INTEGER NOT NULL DEFAULT 0,
+    auto_send      INTEGER NOT NULL DEFAULT 0,
     answer_rating  TEXT NOT NULL DEFAULT 'all',
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -39,6 +40,13 @@ class DB:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SCHEMA)
+            # Миграция для старых БД
+            try:
+                await db.execute(
+                    "ALTER TABLE users ADD COLUMN auto_send INTEGER NOT NULL DEFAULT 0"
+                )
+            except aiosqlite.OperationalError:
+                pass
             await db.commit()
 
     async def ensure_user(self, user_id: int) -> None:
@@ -59,7 +67,7 @@ class DB:
 
     async def update_field(self, user_id: int, field: str, value) -> None:
         allowed = {"wb_token", "tone", "style", "signature",
-                   "auto_enabled", "answer_rating"}
+                   "auto_enabled", "auto_send", "answer_rating"}
         if field not in allowed:
             raise ValueError(f"Поле {field} запрещено к обновлению")
         async with aiosqlite.connect(self.path) as db:

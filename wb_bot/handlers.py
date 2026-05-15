@@ -158,13 +158,13 @@ async def cmd_start(msg: Message, db: DB, settings: Settings) -> None:
         await msg.answer(
             "👋 Привет! Я — бот-автоответчик отзывов Wildberries на базе Gemini.\n\n"
             "Для начала задай WB-токен через кнопку ниже.",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
         )
         return
     await msg.answer(
         await _menu_text(db, msg.from_user.id),
         parse_mode="HTML",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
     )
 
 
@@ -177,7 +177,7 @@ async def cb_back_main(cq: CallbackQuery, db: DB, state: FSMContext) -> None:
     await cq.message.edit_text(
         await _menu_text(db, cq.from_user.id),
         parse_mode="HTML",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
     )
     await cq.answer()
 
@@ -188,7 +188,7 @@ async def cb_show_settings(cq: CallbackQuery, db: DB) -> None:
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_text(
         text,
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
     )
     await cq.answer()
 
@@ -205,7 +205,7 @@ async def cb_toggle_auto(
     await db.update_field(cq.from_user.id, "auto_enabled", new_val)
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_reply_markup(
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]))
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"]))
     )
     if new_val:
         await cq.answer("Авто-показ ВКЛЮЧЁН — проверяю отзывы сейчас...", show_alert=False)
@@ -213,6 +213,32 @@ async def cb_toggle_auto(
         await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
     else:
         await cq.answer("Авто-показ выключен")
+
+
+@router.callback_query(F.data == "toggle_send")
+async def cb_toggle_send(cq: CallbackQuery, db: DB) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
+        return
+    new_val = 0 if u["auto_send"] else 1
+    await db.update_field(cq.from_user.id, "auto_send", new_val)
+    u = await db.get_user(cq.from_user.id)
+    await cq.message.edit_reply_markup(
+        reply_markup=main_menu(
+            bool(u["auto_enabled"]), bool(u["wb_token"]),
+            await db.count_notified(u["user_id"]), bool(u["auto_send"]),
+        )
+    )
+    if new_val:
+        await cq.answer(
+            "⚡ Авто-отправка ВКЛЮЧЕНА.\n"
+            "Бот будет САМ отправлять ответы на WB без подтверждения. "
+            "Проверь настройки тона/стиля/фильтра!",
+            show_alert=True,
+        )
+    else:
+        await cq.answer("Авто-отправка выключена")
 
 
 @router.callback_query(F.data == "check_now")
@@ -388,7 +414,7 @@ async def msg_token(msg: Message, state: FSMContext, db: DB, settings: Settings)
     u = await db.get_user(msg.from_user.id)
     await msg.answer(
         "✅ Токен сохранён и проверен.",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
     )
 
 
@@ -415,7 +441,7 @@ async def msg_signature(msg: Message, state: FSMContext, db: DB) -> None:
     u = await db.get_user(msg.from_user.id)
     await msg.answer(
         "✅ Подпись " + ("удалена." if value is None else "сохранена."),
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
     )
 
 
@@ -441,14 +467,14 @@ async def cb_show(
             log.exception("WB error")
             await cq.message.edit_text(
                 f"❌ Ошибка WB API: {html.escape(str(e))}",
-                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
             )
             return
         filtered = _filter_by_rating(raw, u["answer_rating"])
         if not filtered:
             await cq.message.edit_text(
                 "📭 Неотвеченных отзывов нет.",
-                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
             )
             return
         cache = [{"fb": fb, "answer": None} for fb in filtered]
@@ -535,7 +561,7 @@ async def cb_send(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
     else:
         await cq.message.edit_text(
             "🎉 Все отзывы из текущей пачки обработаны.",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
         )
         _session_cache.pop(cq.from_user.id, None)
 
@@ -549,7 +575,7 @@ async def cb_skip(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
         u = await db.get_user(cq.from_user.id)
         await cq.message.edit_text(
             "🏠 Главное меню",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"])),
+            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
         )
         _session_cache.pop(cq.from_user.id, None)
         return
