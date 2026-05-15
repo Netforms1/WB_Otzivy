@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 
 from aiogram import F, Router
@@ -19,6 +20,7 @@ from .keyboards import (
     cancel_kb,
     feedback_kb,
     main_menu,
+    push_feedback_kb,
     rating_kb,
     style_kb,
     tone_kb,
@@ -80,6 +82,22 @@ def _format_feedback(fb: dict, generated: str, idx: int, total: int) -> str:
         f"📦 <i>{html.escape(product)}</i>\n\n"
         f"<b>Отзыв:</b>\n{html.escape(text)}\n\n"
         f"<b>🤖 Сгенерированный ответ:</b>\n{html.escape(generated)}"
+    )
+
+
+def format_push(fb: dict, generated: str) -> str:
+    rating = fb.get("productValuation") or 0
+    stars = "⭐" * rating + "☆" * (5 - rating)
+    product = (fb.get("productDetails") or {}).get("productName") or "—"
+    text = (fb.get("text") or "(без текста)")[:1500]
+    author = fb.get("userName") or "Покупатель"
+    return (
+        f"🆕 <b>Новый отзыв</b>\n"
+        f"{stars} ({rating}/5)\n"
+        f"👤 <i>{html.escape(author)}</i>\n"
+        f"📦 <i>{html.escape(product)}</i>\n\n"
+        f"<b>Отзыв:</b>\n{html.escape(text)}\n\n"
+        f"<b>🤖 Ответ:</b>\n{html.escape(generated)}"
     )
 
 
@@ -150,7 +168,11 @@ async def cb_toggle_auto(cq: CallbackQuery, db: DB) -> None:
     await cq.message.edit_reply_markup(
         reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]))
     )
-    await cq.answer("Автоответ ВКЛЮЧЁН" if new_val else "Автоответ выключен")
+    await cq.answer(
+        "Авто-показ ВКЛЮЧЁН — новые отзывы будут приходить сюда сами"
+        if new_val else "Авто-показ выключен",
+        show_alert=True,
+    )
 
 
 # --------------------- Выбор тона / стиля / фильтра ---------------------
@@ -410,6 +432,65 @@ async def cb_skip(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
         _session_cache.pop(cq.from_user.id, None)
         return
     await _open_idx(cq, db, gemini, idx + 1)
+
+
+# --------------------- Авто-показ: действия по кнопкам в пуш-сообщении ---------------------
+
+@router.callback_query(F.data.startswith("psend:"))
+async def cb_push_send(cq: CallbackQuery, db: DB) -> None:
+    fb_id = cq.data.split(":", 1)[1]
+    row = await db.get_notified(cq.from_user.id, fb_id)
+    if not row or not row["answer"]:
+        await cq.answer("Отзыв уже обработан или ответ не сгенерирован.", show_alert=True)
+        return
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Нет WB-токена.", show_alert=True)
+        return
+    wb = WBClient(u["wb_token"])
+    try:
+        await wb.answer(fb_id, row["answer"])
+    except WBError as e:
+        await cq.answer(f"Ошибка WB: {e}", show_alert=True)
+        return
+    await db.mark_answered(cq.from_user.id, fb_id)
+    await db.delete_notified(cq.from_user.id, fb_id)
+    await cq.message.edit_text(
+        cq.message.html_text + "\n\n<b>✅ Ответ отправлен на WB</b>",
+        parse_mode="HTML",
+    )
+    await cq.answer("Отправлено")
+
+
+@router.callback_query(F.data.startswith("pregen:"))
+async def cb_push_regen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
+    fb_id = cq.data.split(":", 1)[1]
+    row = await db.get_notified(cq.from_user.id, fb_id)
+    if not row:
+        await cq.answer("Отзыв не найден.", show_alert=True)
+        return
+    fb = json.loads(row["fb_json"])
+    u = await db.get_user(cq.from_user.id)
+    await cq.answer("Перегенерирую...")
+    new_answer = await _gen(gemini, u, fb)
+    await db.update_notified_answer(cq.from_user.id, fb_id, new_answer)
+    await cq.message.edit_text(
+        format_push(fb, new_answer),
+        parse_mode="HTML",
+        reply_markup=push_feedback_kb(fb_id),
+    )
+
+
+@router.callback_query(F.data.startswith("pskip:"))
+async def cb_push_skip(cq: CallbackQuery, db: DB) -> None:
+    fb_id = cq.data.split(":", 1)[1]
+    await db.mark_answered(cq.from_user.id, fb_id)  # чтобы больше не присылал
+    await db.delete_notified(cq.from_user.id, fb_id)
+    await cq.message.edit_text(
+        cq.message.html_text + "\n\n<b>⏭ Пропущено</b>",
+        parse_mode="HTML",
+    )
+    await cq.answer("Пропущено")
 
 
 async def _open_idx(cq: CallbackQuery, db: DB, gemini: GeminiClient, idx: int) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from aiogram import Bot
@@ -9,7 +10,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .config import Settings
 from .db import DB
 from .gemini import GeminiClient, GeminiError
-from .handlers import _filter_by_rating
+from .handlers import _filter_by_rating, format_push
+from .keyboards import push_feedback_kb
 from .wb_api import WBClient, WBError
 
 log = logging.getLogger(__name__)
@@ -36,18 +38,18 @@ async def _process_user(
         raw = await wb.get_unanswered(take=settings.batch_size)
     except WBError as e:
         log.warning("WB error for user %s: %s", user_id, e)
-        await bot.send_message(user_id, f"⚠️ Авто-режим: ошибка WB API — {e}")
         return
 
     feedbacks = _filter_by_rating(raw, u["answer_rating"])
     if not feedbacks:
         return
 
-    sent = 0
+    pushed = 0
     for fb in feedbacks:
         fb_id = fb["id"]
-        if await db.is_answered(user_id, fb_id):
+        if await db.is_answered(user_id, fb_id) or await db.is_notified(user_id, fb_id):
             continue
+
         try:
             answer = await gemini.generate_answer(
                 review_text=fb.get("text") or "",
@@ -62,20 +64,22 @@ async def _process_user(
             continue
 
         try:
-            await wb.answer(fb_id, answer)
-        except WBError as e:
-            log.warning("WB answer failed: %s", e)
+            await bot.send_message(
+                user_id,
+                format_push(fb, answer),
+                parse_mode="HTML",
+                reply_markup=push_feedback_kb(fb_id),
+            )
+        except Exception:
+            log.exception("Не удалось отправить пуш-сообщение user=%s", user_id)
             continue
 
-        await db.mark_answered(user_id, fb_id)
-        sent += 1
-        # Пауза между ответами, чтобы не упереться в rate-limit WB
-        await asyncio.sleep(1.5)
+        await db.add_notified(user_id, fb_id, answer, json.dumps(fb, ensure_ascii=False))
+        pushed += 1
+        await asyncio.sleep(1.5)  # мягкий троттлинг
 
-    if sent:
-        await bot.send_message(
-            user_id, f"🤖 Авто-режим: отправлено ответов — {sent}"
-        )
+    if pushed:
+        log.info("Авто-показ: пользователю %s выслано %d новых отзывов", user_id, pushed)
 
 
 def setup_scheduler(

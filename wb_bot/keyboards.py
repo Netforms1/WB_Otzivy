@@ -26,7 +26,7 @@ RATING_FILTERS = [
 def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📋 Показать новые отзывы", callback_data="show:0")
-    auto_label = "🟢 Автоответ: ВКЛ" if auto_enabled else "⚪️ Автоответ: ВЫКЛ"
+    auto_label = "🟢 Авто-показ новых отзывов: ВКЛ" if auto_enabled else "⚪️ Авто-показ новых отзывов: ВЫКЛ"
     b.button(text=auto_label, callback_data="toggle_auto")
     b.button(text="🎭 Тон ответа", callback_data="menu:tone")
     b.button(text="🪶 Стиль ответа", callback_data="menu:style")
@@ -70,6 +70,16 @@ def feedback_kb(feedback_id: str, idx: int, total: int) -> InlineKeyboardMarkup:
         b.button(text=f"➡️ Следующий ({idx + 2}/{total})", callback_data=f"show:{idx + 1}")
     b.button(text="🏠 В меню", callback_data="back_main")
     b.adjust(2, 1, 1, 1)
+    return b.as_markup()
+
+
+def push_feedback_kb(feedback_id: str) -> InlineKeyboardMarkup:
+    """Кнопки для отзыва, который пришёл сам (авто-показ)."""
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Отправить", callback_data=f"psend:{feedback_id}")
+    b.button(text="🔄 Перегенерировать", callback_data=f"pregen:{feedback_id}")
+    b.button(text="⏭ Пропустить", callback_data=f"pskip:{feedback_id}")
+    b.adjust(2, 1)
     return b.as_markup()
 
 

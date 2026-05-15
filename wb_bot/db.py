@@ -20,6 +20,15 @@ CREATE TABLE IF NOT EXISTS answered (
     answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, feedback_id)
 );
+
+CREATE TABLE IF NOT EXISTS notified (
+    user_id     INTEGER NOT NULL,
+    feedback_id TEXT NOT NULL,
+    answer      TEXT,
+    fb_json     TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, feedback_id)
+);
 """
 
 
@@ -83,3 +92,52 @@ class DB:
                 (user_id, feedback_id),
             )
             return await cur.fetchone() is not None
+
+    async def is_notified(self, user_id: int, feedback_id: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM notified WHERE user_id = ? AND feedback_id = ?",
+                (user_id, feedback_id),
+            )
+            return await cur.fetchone() is not None
+
+    async def add_notified(
+        self, user_id: int, feedback_id: str, answer: str, fb_json: str
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO notified(user_id, feedback_id, answer, fb_json)"
+                " VALUES (?, ?, ?, ?)",
+                (user_id, feedback_id, answer, fb_json),
+            )
+            await db.commit()
+
+    async def get_notified(self, user_id: int, feedback_id: str) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT answer, fb_json FROM notified"
+                " WHERE user_id = ? AND feedback_id = ?",
+                (user_id, feedback_id),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def update_notified_answer(
+        self, user_id: int, feedback_id: str, answer: str
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE notified SET answer = ?"
+                " WHERE user_id = ? AND feedback_id = ?",
+                (answer, user_id, feedback_id),
+            )
+            await db.commit()
+
+    async def delete_notified(self, user_id: int, feedback_id: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "DELETE FROM notified WHERE user_id = ? AND feedback_id = ?",
+                (user_id, feedback_id),
+            )
+            await db.commit()
