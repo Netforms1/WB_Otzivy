@@ -12,7 +12,7 @@ from .db import DB
 from .gemini import GeminiClient, GeminiError
 from .handlers import _filter_by_rating, format_push
 from .keyboards import push_feedback_kb
-from .wb_api import WBClient, WBError
+from .wb_api import WBClient, WBError, WBRateLimited
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ async def _process_user(
     wb = WBClient(u["wb_token"])
     try:
         raw = await wb.get_unanswered(take=settings.batch_size)
+    except WBRateLimited:
+        log.info("user %s: WB лимит, пропускаем цикл", user_id)
+        return 0
     except WBError as e:
         log.warning("WB error for user %s: %s", user_id, e)
         return 0

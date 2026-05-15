@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import httpx
 
 BASE_URL = "https://feedbacks-api.wildberries.ru"
 log = logging.getLogger(__name__)
 
+# Глобальный cooldown по токену: после 429 не дёргаем WB до этого момента
+_cooldown_until: dict[str, float] = {}
+
 
 class WBError(Exception):
     pass
+
+
+class WBRateLimited(WBError):
+    """429 от WB — без ретраев, просто ждать следующего цикла."""
 
 
 class WBClient:
@@ -19,34 +27,38 @@ class WBClient:
     Документация: https://dev.wildberries.ru/openapi/user-communication
     """
 
-    def __init__(self, token: str, timeout: float = 30.0, max_retries: int = 3):
+    def __init__(self, token: str, timeout: float = 30.0):
         self.token = token
         self.timeout = timeout
-        self.max_retries = max_retries
 
     def _headers(self) -> dict:
         return {"Authorization": self.token, "Content-Type": "application/json"}
 
+    def _check_cooldown(self) -> None:
+        until = _cooldown_until.get(self.token, 0.0)
+        left = until - time.monotonic()
+        if left > 0:
+            raise WBRateLimited(
+                f"WB rate-limit: ждём {int(left)} сек перед следующим запросом"
+            )
+
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        url = f"{BASE_URL}{path}"
+        self._check_cooldown()
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for attempt in range(self.max_retries + 1):
-                r = await client.request(method, url, headers=self._headers(), **kwargs)
-                if r.status_code != 429:
-                    return r
-                # Уважаем Retry-After, но не больше 30 сек
-                retry_after = r.headers.get("Retry-After")
-                try:
-                    delay = min(float(retry_after), 30.0) if retry_after else 2 ** attempt
-                except ValueError:
-                    delay = 2 ** attempt
-                if attempt == self.max_retries:
-                    raise WBError(
-                        f"WB API 429: лимит запросов превышен. Подождите ~{int(delay)} сек."
-                    )
-                log.warning("WB 429, retry in %.1fs (attempt %d)", delay, attempt + 1)
-                await asyncio.sleep(delay)
-            return r
+            r = await client.request(
+                method, f"{BASE_URL}{path}", headers=self._headers(), **kwargs
+            )
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else 60.0
+            except ValueError:
+                wait = 60.0
+            wait = min(max(wait, 30.0), 300.0)
+            _cooldown_until[self.token] = time.monotonic() + wait
+            log.info("WB 429, cooldown %.0f сек", wait)
+            raise WBRateLimited(f"WB лимит: следующий запрос через {int(wait)} сек")
+        return r
 
     async def get_unanswered(self, take: int = 20, skip: int = 0) -> list[dict]:
         params = {"isAnswered": "false", "take": take, "skip": skip, "order": "dateDesc"}
@@ -68,6 +80,9 @@ class WBClient:
         """Простая проверка валидности токена."""
         try:
             await self.get_unanswered(take=1)
+            return True
+        except WBRateLimited:
+            # 429 = токен прошёл авторизацию, просто упёрлись в лимит
             return True
         except WBError:
             return False
