@@ -23,8 +23,10 @@ RATING_FILTERS = [
 ]
 
 
-def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
+def main_menu(auto_enabled: bool, has_token: bool, pending: int = 0) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    if pending > 0:
+        b.button(text=f"📂 Открыть сохранённые ({pending})", callback_data="open_saved")
     b.button(text="📋 Показать новые отзывы", callback_data="show:0")
     b.button(text="🔄 Проверить отзывы сейчас", callback_data="check_now")
     auto_label = "🟢 Авто-показ новых отзывов: ВКЛ" if auto_enabled else "⚪️ Авто-показ новых отзывов: ВЫКЛ"
@@ -37,7 +39,11 @@ def main_menu(auto_enabled: bool, has_token: bool) -> InlineKeyboardMarkup:
     b.button(text=token_label, callback_data="set_token")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
     b.button(text="🗑 Сбросить историю показов", callback_data="reset_notified")
-    b.adjust(1, 1, 1, 2, 1, 1, 1, 1, 1)
+    # Раскладка зависит от того, есть ли «сохранённые»
+    if pending > 0:
+        b.adjust(1, 1, 1, 1, 2, 1, 1, 1, 1, 1)
+    else:
+        b.adjust(1, 1, 1, 2, 1, 1, 1, 1, 1)
     return b.as_markup()
 
 

@@ -142,6 +142,24 @@ class DB:
             row = await cur.fetchone()
             return row[0] if row else 0
 
+    async def count_notified(self, user_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM notified WHERE user_id = ?", (user_id,)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def list_notified(self, user_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT feedback_id, answer, fb_json FROM notified"
+                " WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
     async def delete_notified(self, user_id: int, feedback_id: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
