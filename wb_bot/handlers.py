@@ -43,6 +43,20 @@ def _is_admin(user_id: int, settings: Settings) -> bool:
     return not settings.admin_ids or user_id in settings.admin_ids
 
 
+@router.message.outer_middleware()
+@router.callback_query.outer_middleware()
+async def admin_only_mw(handler, event, data):
+    settings: Settings = data["settings"]
+    user = event.from_user
+    if user is None or not _is_admin(user.id, settings):
+        if isinstance(event, CallbackQuery):
+            await event.answer("⛔️ Доступ запрещён.", show_alert=True)
+        else:
+            await event.answer("⛔️ Доступ запрещён.")
+        return
+    return await handler(event, data)
+
+
 def _filter_by_rating(feedbacks: list[dict], rating_filter: str) -> list[dict]:
     if rating_filter == "neg":
         return [f for f in feedbacks if (f.get("productValuation") or 0) <= 3]
@@ -89,9 +103,6 @@ async def _settings_text(db: DB, user_id: int) -> str:
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message, db: DB, settings: Settings) -> None:
-    if not _is_admin(msg.from_user.id, settings):
-        await msg.answer("⛔️ Доступ запрещён.")
-        return
     await db.ensure_user(msg.from_user.id)
     u = await db.get_user(msg.from_user.id)
     await msg.answer(
@@ -210,7 +221,10 @@ async def cb_set_token(cq: CallbackQuery, state: FSMContext) -> None:
 @router.message(TokenInput.waiting)
 async def msg_token(msg: Message, state: FSMContext, db: DB, settings: Settings) -> None:
     token = (msg.text or "").strip()
-    await msg.delete()  # чтобы токен не висел в чате
+    try:
+        await msg.delete()  # чтобы токен не висел в чате
+    except Exception:
+        log.info("Не удалось удалить сообщение с токеном (нет прав)")
     if len(token) < 20:
         await msg.answer("❌ Похоже, это не токен. Попробуйте ещё раз.",
                          reply_markup=cancel_kb())
@@ -348,7 +362,7 @@ async def cb_regen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
 
 
 @router.callback_query(F.data.startswith("send:"))
-async def cb_send(cq: CallbackQuery, db: DB) -> None:
+async def cb_send(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
     fb_id = cq.data.split(":", 1)[1]
     cache = _session_cache.get(cq.from_user.id) or []
     idx, item = next(
@@ -371,7 +385,7 @@ async def cb_send(cq: CallbackQuery, db: DB) -> None:
     await cq.answer("✅ Ответ отправлен на WB")
 
     if idx + 1 < len(cache):
-        await _open_idx(cq, db, idx + 1)
+        await _open_idx(cq, db, gemini, idx + 1)
     else:
         await cq.message.edit_text(
             "🎉 Все отзывы из текущей пачки обработаны.",
@@ -381,7 +395,7 @@ async def cb_send(cq: CallbackQuery, db: DB) -> None:
 
 
 @router.callback_query(F.data.startswith("skip:"))
-async def cb_skip(cq: CallbackQuery, db: DB) -> None:
+async def cb_skip(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
     idx = int(cq.data.split(":", 1)[1])
     cache = _session_cache.get(cq.from_user.id) or []
     if idx + 1 >= len(cache):
@@ -393,16 +407,20 @@ async def cb_skip(cq: CallbackQuery, db: DB) -> None:
         )
         _session_cache.pop(cq.from_user.id, None)
         return
-    await _open_idx(cq, db, idx + 1)
+    await _open_idx(cq, db, gemini, idx + 1)
 
 
-async def _open_idx(cq: CallbackQuery, db: DB, idx: int) -> None:
+async def _open_idx(cq: CallbackQuery, db: DB, gemini: GeminiClient, idx: int) -> None:
     cache = _session_cache.get(cq.from_user.id) or []
     if idx >= len(cache):
         return
     item = cache[idx]
+    if not item["answer"]:
+        await cq.message.edit_text(f"🤖 Генерирую ответ ({idx + 1}/{len(cache)})...")
+        u = await db.get_user(cq.from_user.id)
+        item["answer"] = await _gen(gemini, u, item["fb"])
     await cq.message.edit_text(
-        _format_feedback(item["fb"], item["answer"] or "(не сгенерирован)", idx, len(cache)),
+        _format_feedback(item["fb"], item["answer"], idx, len(cache)),
         parse_mode="HTML",
         reply_markup=feedback_kb(item["fb"]["id"], idx, len(cache)),
     )
