@@ -25,20 +25,29 @@ RATING_FILTERS = [
 ]
 
 
-def main_menu(has_token: bool, pending: int, auto_send: bool) -> InlineKeyboardMarkup:
+def main_menu(
+    has_wb: bool, has_ozon: bool, pending: int, auto_send: bool
+) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🔄 Обновить с WB", callback_data="refresh")
+    label = "🔄 Обновить"
+    if has_wb and has_ozon:
+        label = "🔄 Обновить (WB + Ozon)"
+    elif has_wb:
+        label = "🔄 Обновить с WB"
+    elif has_ozon:
+        label = "🔄 Обновить с Ozon"
+    b.button(text=label, callback_data="refresh")
     if pending > 0:
         b.button(text=f"📂 Открыть буфер ({pending})", callback_data="open_buffer")
     send_label = "⚡ Авто-отправка: ВКЛ" if auto_send else "🚫 Авто-отправка: ВЫКЛ"
     b.button(text=send_label, callback_data="toggle_send")
     b.button(text="⚙️ Настройки", callback_data="menu:settings")
-    if has_token:
-        b.button(text="🔬 Проверить токен", callback_data="check_token")
-    # Раскладка
-    if has_token and pending > 0:
+    if has_wb or has_ozon:
+        b.button(text="🔬 Проверить ключи", callback_data="check_keys")
+    has_keys = has_wb or has_ozon
+    if has_keys and pending > 0:
         b.adjust(1, 1, 1, 2)
-    elif has_token:
+    elif has_keys:
         b.adjust(1, 1, 2)
     elif pending > 0:
         b.adjust(1, 1, 1, 1)
@@ -47,19 +56,23 @@ def main_menu(has_token: bool, pending: int, auto_send: bool) -> InlineKeyboardM
     return b.as_markup()
 
 
-def settings_menu(has_token: bool, pending: int) -> InlineKeyboardMarkup:
+def settings_menu(
+    has_wb: bool, has_ozon: bool, pending: int
+) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🎭 Тон ответа", callback_data="menu:tone")
     b.button(text="🪶 Стиль ответа", callback_data="menu:style")
     b.button(text="🔍 Фильтр оценок", callback_data="menu:rating")
     b.button(text="✍️ Подпись магазина", callback_data="set_signature")
-    token_label = "🔑 Сменить WB-токен" if has_token else "🔑 Задать WB-токен"
-    b.button(text=token_label, callback_data="set_token")
+    wb_label = "🟣 Сменить WB-токен" if has_wb else "🟣 Задать WB-токен"
+    b.button(text=wb_label, callback_data="set_wb_token")
+    ozon_label = "🟦 Сменить Ozon-ключи" if has_ozon else "🟦 Задать Ozon-ключи"
+    b.button(text=ozon_label, callback_data="set_ozon_keys")
     if pending > 0:
         b.button(text=f"🗑 Очистить буфер ({pending})", callback_data="clear_buffer")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
     b.button(text="⬅️ В главное меню", callback_data="back_main")
-    b.adjust(2, 2, 1, 1, 1, 1)
+    b.adjust(2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -85,12 +98,13 @@ def rating_kb(current: str) -> InlineKeyboardMarkup:
     return choices_kb(RATING_FILTERS, "rating", current)
 
 
-def buffer_item_kb(kind: str, item_id: str) -> InlineKeyboardMarkup:
-    """Кнопки для одного элемента буфера (отзыв или вопрос)."""
+def buffer_item_kb(source: str, kind: str, item_id: str) -> InlineKeyboardMarkup:
+    """Кнопки для одного элемента буфера. source: wb|ozon, kind: feedback|question|review."""
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Отправить", callback_data=f"send:{kind}:{item_id}")
-    b.button(text="🔄 Перегенерировать", callback_data=f"regen:{kind}:{item_id}")
-    b.button(text="⏭ Пропустить", callback_data=f"skip:{kind}:{item_id}")
+    payload = f"{source}:{kind}:{item_id}"
+    b.button(text="✅ Отправить", callback_data=f"send:{payload}")
+    b.button(text="🔄 Перегенерировать", callback_data=f"regen:{payload}")
+    b.button(text="⏭ Пропустить", callback_data=f"skip:{payload}")
     b.adjust(2, 1)
     return b.as_markup()
 
