@@ -68,6 +68,57 @@ class GeminiClient:
 {sig_block}
 """
 
+    async def generate_question_answer(
+        self,
+        question_text: str,
+        product_name: str | None,
+        tone: str,
+        style: str,
+        signature: str | None,
+    ) -> str:
+        tone_desc = TONE_LABELS.get(tone, TONE_LABELS["friendly"])
+        style_desc = STYLE_LABELS.get(style, STYLE_LABELS["medium"])
+        sig_block = f"\nПодпись магазина: {signature}" if signature else ""
+        product_block = f"\nТовар: {product_name}" if product_name else ""
+        prompt = f"""Ты — менеджер магазина на Wildberries, отвечаешь на ВОПРОС покупателя.
+
+Правила:
+- Тон: {tone_desc}
+- Стиль: {style_desc}
+- Пиши только на русском.
+- Не используй markdown, ссылки, контакты вне Wildberries, цены или обещания.
+- Не упоминай конкурентов и не критикуй WB.
+- Обращайся к покупателю на «Вы».
+- Если в вопросе спрашивают факт о товаре (размер, материал, состав), а информации нет — честно укажи, что точные характеристики смотрите в карточке товара.
+- В ответе должен быть ТОЛЬКО текст ответа покупателю, без префиксов.
+{product_block}
+Вопрос покупателя:
+\"\"\"{question_text}\"\"\"
+{sig_block}
+"""
+        return await self._call(prompt)
+
+    async def _call(self, prompt: str) -> str:
+        url = API_URL.format(model=self.model)
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.8,
+                "topP": 0.9,
+                "maxOutputTokens": 800,
+            },
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(url, params={"key": self.api_key}, json=payload)
+            if r.status_code != 200:
+                raise GeminiError(f"Gemini {r.status_code}: {r.text}")
+            data = r.json()
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise GeminiError(f"Не удалось распарсить ответ Gemini: {data}") from e
+        return text.strip()
+
     async def generate_answer(
         self,
         review_text: str,
@@ -80,28 +131,4 @@ class GeminiClient:
         prompt = self._build_prompt(
             review_text, rating, product_name, tone, style, signature
         )
-        url = API_URL.format(model=self.model)
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.8,
-                "topP": 0.9,
-                "maxOutputTokens": 800,
-            },
-        }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(
-                url,
-                params={"key": self.api_key},
-                json=payload,
-            )
-            if r.status_code != 200:
-                raise GeminiError(f"Gemini {r.status_code}: {r.text}")
-            data = r.json()
-
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise GeminiError(f"Не удалось распарсить ответ Gemini: {data}") from e
-
-        return text.strip()
+        return await self._call(prompt)

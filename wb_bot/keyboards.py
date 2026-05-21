@@ -33,6 +33,7 @@ def main_menu(
     if pending > 0:
         b.button(text=f"📂 Открыть сохранённые ({pending})", callback_data="open_saved")
     b.button(text="📋 Показать новые отзывы", callback_data="show:0")
+    b.button(text="❓ Показать новые вопросы", callback_data="show_questions")
     b.button(text="🔄 Проверить отзывы сейчас", callback_data="check_now")
     auto_label = "🟢 Авто-показ в чат: ВКЛ" if auto_enabled else "⚪️ Авто-показ в чат: ВЫКЛ"
     b.button(text=auto_label, callback_data="toggle_auto")
@@ -44,13 +45,21 @@ def main_menu(
     b.button(text="✍️ Подпись магазина", callback_data="set_signature")
     token_label = "🔑 WB-токен: задан ✅" if has_token else "🔑 Задать WB-токен"
     b.button(text=token_label, callback_data="set_token")
+    if has_token:
+        b.button(text="🔬 Проверить WB-токен", callback_data="check_token")
     b.button(text="ℹ️ Текущие настройки", callback_data="show_settings")
     b.button(text="🗑 Сбросить историю показов", callback_data="reset_notified")
-    # Авто-показ и Авто-отправка — двумя кнопками в одну строку
-    if pending > 0:
-        b.adjust(1, 1, 1, 2, 2, 1, 1, 1, 1, 1)
+    # Лейаут: каждая кнопка на свою строку, кроме явно парных
+    if has_token:
+        if pending > 0:
+            b.adjust(1, 1, 1, 1, 2, 2, 1, 1, 1, 2, 1, 1)
+        else:
+            b.adjust(1, 1, 1, 2, 2, 1, 1, 1, 2, 1, 1)
     else:
-        b.adjust(1, 1, 2, 2, 1, 1, 1, 1, 1)
+        if pending > 0:
+            b.adjust(1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1)
+        else:
+            b.adjust(1, 1, 1, 2, 2, 1, 1, 1, 1, 1)
     return b.as_markup()
 
 
@@ -85,6 +94,15 @@ def feedback_kb(feedback_id: str, idx: int, total: int) -> InlineKeyboardMarkup:
         b.button(text=f"➡️ Следующий ({idx + 2}/{total})", callback_data=f"show:{idx + 1}")
     b.button(text="🏠 В меню", callback_data="back_main")
     b.adjust(2, 1, 1, 1)
+    return b.as_markup()
+
+
+def question_kb(question_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Отправить", callback_data=f"qsend:{question_id}")
+    b.button(text="🔄 Перегенерировать", callback_data=f"qregen:{question_id}")
+    b.button(text="⏭ Пропустить", callback_data=f"qskip:{question_id}")
+    b.adjust(2, 1)
     return b.as_markup()
 
 

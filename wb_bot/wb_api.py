@@ -80,13 +80,62 @@ class WBClient:
         if r.status_code not in (200, 204):
             raise WBError(f"WB API {r.status_code}: {r.text}")
 
+    async def get_questions(self, take: int = 20, skip: int = 0) -> list[dict]:
+        params = {"isAnswered": "false", "take": take, "skip": skip, "order": "dateDesc"}
+        r = await self._request("GET", "/api/v1/questions", params=params)
+        if r.status_code != 200:
+            raise WBError(f"WB API {r.status_code}: {r.text}")
+        data = r.json()
+        if data.get("error"):
+            raise WBError(data.get("errorText") or "WB API error")
+        return data.get("data", {}).get("questions") or []
+
+    async def answer_question(self, question_id: str, text: str) -> None:
+        payload = {"id": question_id, "answer": {"text": text}, "state": "wbRu"}
+        r = await self._request("PATCH", "/api/v1/questions", json=payload)
+        if r.status_code not in (200, 204):
+            raise WBError(f"WB API {r.status_code}: {r.text}")
+
     async def ping(self) -> bool:
         """Простая проверка валидности токена."""
+        status, _ = await self.check()
+        return status in ("ok", "rate_limited")
+
+    async def check(self) -> tuple[str, str]:
+        """Детальная проверка. Возвращает (status, message).
+
+        status: ok | rate_limited | unauthorized | network | error
+        """
+        left = self.cooldown_left()
+        if left > 0:
+            return "rate_limited", f"WB на cooldown ещё ~{left // 60 + 1} мин"
         try:
-            await self.get_unanswered(take=1)
-            return True
-        except WBRateLimited:
-            # 429 = токен прошёл авторизацию, просто упёрлись в лимит
-            return True
-        except WBError:
-            return False
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.get(
+                    f"{BASE_URL}/api/v1/feedbacks",
+                    headers=self._headers(),
+                    params={"isAnswered": "false", "take": 1, "skip": 0},
+                )
+        except httpx.RequestError as e:
+            return "network", f"Сетевая ошибка: {e}"
+
+        if r.status_code == 200:
+            data = r.json()
+            count = data.get("data", {}).get("countUnanswered")
+            if count is None:
+                count = len(data.get("data", {}).get("feedbacks") or [])
+            return "ok", f"Неотвеченных в WB: {count}"
+        if r.status_code == 401:
+            return "unauthorized", "401 — токен невалиден или истёк"
+        if r.status_code == 403:
+            return "unauthorized", "403 — у токена нет прав на 'Отзывы и вопросы'"
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else 300.0
+            except ValueError:
+                wait = 300.0
+            wait = min(max(wait, 120.0), 900.0)
+            _cooldown_until[self.token] = time.monotonic() + wait
+            return "rate_limited", f"429 — лимит WB, cooldown {int(wait)} сек"
+        return "error", f"WB вернул {r.status_code}: {r.text[:200]}"

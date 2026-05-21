@@ -21,6 +21,7 @@ from .keyboards import (
     feedback_kb,
     main_menu,
     push_feedback_kb,
+    question_kb,
     rating_kb,
     style_kb,
     tone_kb,
@@ -239,6 +240,160 @@ async def cb_toggle_send(cq: CallbackQuery, db: DB) -> None:
         )
     else:
         await cq.answer("Авто-отправка выключена")
+
+
+# --------------------- Вопросы ---------------------
+
+# user_id -> {question_id: {"q": dict, "answer": str}}
+_question_cache: dict[int, dict[str, dict]] = {}
+
+
+def _format_question(q: dict, generated: str) -> str:
+    product = (q.get("productDetails") or {}).get("productName") or "—"
+    text = q.get("text") or "(без текста)"
+    return (
+        f"❓ <b>Новый вопрос</b>\n"
+        f"📦 <i>{html.escape(product)}</i>\n\n"
+        f"<b>Вопрос:</b>\n{html.escape(text)}\n\n"
+        f"<b>🤖 Ответ:</b>\n{html.escape(generated)}"
+    )
+
+
+async def _gen_question(gemini: GeminiClient, u: dict, q: dict) -> str:
+    try:
+        return await gemini.generate_question_answer(
+            question_text=q.get("text") or "",
+            product_name=(q.get("productDetails") or {}).get("productName"),
+            tone=u["tone"],
+            style=u["style"],
+            signature=u["signature"],
+        )
+    except GeminiError as e:
+        log.exception("Gemini error")
+        return f"[Ошибка генерации: {e}]"
+
+
+@router.callback_query(F.data == "show_questions")
+async def cb_show_questions(
+    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
+) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
+        return
+    from .wb_api import WBClient
+    wb = WBClient(u["wb_token"])
+    if wb.cooldown_left() > 0:
+        await cq.answer(
+            f"WB на cooldown ~{wb.cooldown_left() // 60 + 1} мин",
+            show_alert=True,
+        )
+        return
+    await cq.answer("Загружаю вопросы...")
+    try:
+        questions = await wb.get_questions(take=settings.batch_size)
+    except WBError as e:
+        await cq.bot.send_message(cq.from_user.id, f"❌ {html.escape(str(e))}")
+        return
+    if not questions:
+        await cq.bot.send_message(cq.from_user.id, "📭 Новых вопросов нет.")
+        return
+
+    cache = _question_cache.setdefault(cq.from_user.id, {})
+    for q in questions:
+        ans = await _gen_question(gemini, u, q)
+        cache[q["id"]] = {"q": q, "answer": ans}
+        try:
+            await cq.bot.send_message(
+                cq.from_user.id,
+                _format_question(q, ans),
+                parse_mode="HTML",
+                reply_markup=question_kb(q["id"]),
+            )
+        except Exception:
+            log.exception("send question failed")
+
+
+@router.callback_query(F.data.startswith("qsend:"))
+async def cb_qsend(cq: CallbackQuery, db: DB) -> None:
+    qid = cq.data.split(":", 1)[1]
+    item = _question_cache.get(cq.from_user.id, {}).get(qid)
+    if not item:
+        await cq.answer("Вопрос не найден в сессии.", show_alert=True)
+        return
+    u = await db.get_user(cq.from_user.id)
+    from .wb_api import WBClient
+    wb = WBClient(u["wb_token"])
+    try:
+        await wb.answer_question(qid, item["answer"])
+    except WBError as e:
+        await cq.answer(f"Ошибка WB: {e}", show_alert=True)
+        return
+    _question_cache.get(cq.from_user.id, {}).pop(qid, None)
+    await cq.message.edit_text(
+        cq.message.html_text + "\n\n<b>✅ Ответ отправлен</b>",
+        parse_mode="HTML",
+    )
+    await cq.answer("Отправлено")
+
+
+@router.callback_query(F.data.startswith("qregen:"))
+async def cb_qregen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
+    qid = cq.data.split(":", 1)[1]
+    item = _question_cache.get(cq.from_user.id, {}).get(qid)
+    if not item:
+        await cq.answer("Вопрос не найден.", show_alert=True)
+        return
+    u = await db.get_user(cq.from_user.id)
+    await cq.answer("Перегенерирую...")
+    item["answer"] = await _gen_question(gemini, u, item["q"])
+    await cq.message.edit_text(
+        _format_question(item["q"], item["answer"]),
+        parse_mode="HTML",
+        reply_markup=question_kb(qid),
+    )
+
+
+@router.callback_query(F.data.startswith("qskip:"))
+async def cb_qskip(cq: CallbackQuery) -> None:
+    qid = cq.data.split(":", 1)[1]
+    _question_cache.get(cq.from_user.id, {}).pop(qid, None)
+    await cq.message.edit_text(
+        cq.message.html_text + "\n\n<b>⏭ Пропущено</b>",
+        parse_mode="HTML",
+    )
+    await cq.answer("Пропущено")
+
+
+@router.callback_query(F.data == "check_token")
+async def cb_check_token(cq: CallbackQuery, db: DB) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Токен не задан.", show_alert=True)
+        return
+    await cq.answer("Проверяю...")
+    from .wb_api import WBClient
+    wb = WBClient(u["wb_token"])
+    status, msg = await wb.check()
+    icons = {
+        "ok": "✅",
+        "rate_limited": "⏳",
+        "unauthorized": "❌",
+        "network": "📡",
+        "error": "⚠️",
+    }
+    titles = {
+        "ok": "Токен валиден",
+        "rate_limited": "Токен валиден, но WB на cooldown",
+        "unauthorized": "Токен невалиден",
+        "network": "Сетевая ошибка",
+        "error": "Ошибка WB",
+    }
+    await cq.bot.send_message(
+        cq.from_user.id,
+        f"{icons.get(status, '❓')} <b>{titles.get(status, status)}</b>\n{html.escape(msg)}",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "check_now")
