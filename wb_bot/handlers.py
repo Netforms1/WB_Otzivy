@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
+from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -17,32 +19,25 @@ from .keyboards import (
     RATING_FILTERS,
     STYLES,
     TONES,
+    buffer_item_kb,
     cancel_kb,
-    feedback_kb,
     main_menu,
-    push_feedback_kb,
-    question_kb,
     rating_kb,
+    settings_menu,
     style_kb,
     tone_kb,
 )
-from .wb_api import WBClient, WBError
+from .wb_api import WBClient, WBError, WBRateLimited
 
 log = logging.getLogger(__name__)
 router = Router()
 
 
-# In-memory cache: user_id -> list of (feedback_dict, generated_answer)
-_session_cache: dict[int, list[dict]] = {}
+# user_id -> {"feedbacks": int, "questions": int, "ts": datetime}
+last_check: dict[int, dict] = {}
 
 
-class TokenInput(StatesGroup):
-    waiting = State()
-
-
-class SignatureInput(StatesGroup):
-    waiting = State()
-
+# --------------------- Доступ ---------------------
 
 def _is_admin(user_id: int, settings: Settings) -> bool:
     return not settings.admin_ids or user_id in settings.admin_ids
@@ -62,6 +57,18 @@ async def admin_only_mw(handler, event, data):
     return await handler(event, data)
 
 
+# --------------------- FSM ---------------------
+
+class TokenInput(StatesGroup):
+    waiting = State()
+
+
+class SignatureInput(StatesGroup):
+    waiting = State()
+
+
+# --------------------- Тексты ---------------------
+
 def _filter_by_rating(feedbacks: list[dict], rating_filter: str) -> list[dict]:
     if rating_filter == "neg":
         return [f for f in feedbacks if (f.get("productValuation") or 0) <= 3]
@@ -70,421 +77,141 @@ def _filter_by_rating(feedbacks: list[dict], rating_filter: str) -> list[dict]:
     return feedbacks
 
 
-def _format_feedback(fb: dict, generated: str, idx: int, total: int) -> str:
-    rating = fb.get("productValuation") or 0
-    stars = "⭐" * rating + "☆" * (5 - rating)
-    product = (fb.get("productDetails") or {}).get("productName") or "—"
-    text = fb.get("text") or "(без текста)"
-    author = fb.get("userName") or "Покупатель"
-    return (
-        f"<b>Отзыв {idx + 1}/{total}</b>\n"
-        f"{stars} ({rating}/5)\n"
-        f"👤 <i>{html.escape(author)}</i>\n"
-        f"📦 <i>{html.escape(product)}</i>\n\n"
-        f"<b>Отзыв:</b>\n{html.escape(text)}\n\n"
-        f"<b>🤖 Сгенерированный ответ:</b>\n{html.escape(generated)}"
-    )
-
-
-def format_push(fb: dict, generated: str) -> str:
-    rating = fb.get("productValuation") or 0
-    stars = "⭐" * rating + "☆" * (5 - rating)
+def _format_item(fb: dict, answer: str, kind: str) -> str:
     product = (fb.get("productDetails") or {}).get("productName") or "—"
     text = (fb.get("text") or "(без текста)")[:1500]
     author = fb.get("userName") or "Покупатель"
+    if kind == "question":
+        header = "❓ <b>Вопрос</b>"
+        rating_line = ""
+    else:
+        rating = fb.get("productValuation") or 0
+        stars = "⭐" * rating + "☆" * (5 - rating)
+        header = "📬 <b>Отзыв</b>"
+        rating_line = f"{stars} ({rating}/5)\n"
     return (
-        f"🆕 <b>Новый отзыв</b>\n"
-        f"{stars} ({rating}/5)\n"
+        f"{header}\n"
+        f"{rating_line}"
         f"👤 <i>{html.escape(author)}</i>\n"
         f"📦 <i>{html.escape(product)}</i>\n\n"
-        f"<b>Отзыв:</b>\n{html.escape(text)}\n\n"
-        f"<b>🤖 Ответ:</b>\n{html.escape(generated)}"
+        f"<b>Текст:</b>\n{html.escape(text)}\n\n"
+        f"<b>🤖 Ответ:</b>\n{html.escape(answer)}"
     )
 
 
 async def _menu_text(db: DB, user_id: int) -> str:
-    from datetime import datetime, timezone
-    from .scheduler import last_check
-    from .wb_api import WBClient
-
     u = await db.get_user(user_id)
     answered = await db.count_answered(user_id)
+    counts = await db.count_notified_by_kind(user_id)
+    pending_total = sum(counts.values())
     info = last_check.get(user_id)
 
-    lines = ["🏠 <b>Главное меню</b>", ""]
+    lines = ["🏠 <b>WB Бот-автоответчик</b>", ""]
     if info:
         ago_sec = (datetime.now(timezone.utc) - info["ts"]).total_seconds()
         ago = f"{int(ago_sec // 60)} мин назад" if ago_sec >= 60 else f"{int(ago_sec)} сек назад"
-        lines.append(f"📬 Неотвечено в WB: <b>{info['total']}</b> (обновлено {ago})")
+        lines.append(f"📬 Отзывов в WB: <b>{info.get('feedbacks', '?')}</b>")
+        lines.append(f"❓ Вопросов в WB: <b>{info.get('questions', '?')}</b>")
+        lines.append(f"   <i>обновлено {ago}</i>")
     else:
-        lines.append("📬 Неотвечено в WB: <i>ещё не проверял</i>")
-    lines.append(f"✅ Ответил через бота: <b>{answered}</b>")
-    pending = await db.count_notified(user_id)
-    if pending:
-        lines.append(f"📂 Сохранено и ждёт ответа: <b>{pending}</b>")
+        lines.append("📬 Ещё не обновлял. Нажми «🔄 Обновить с WB».")
+    lines.append("")
+    lines.append(f"📂 В буфере: <b>{pending_total}</b> (готовы к отправке)")
+    if pending_total > 0:
+        parts = []
+        if counts.get("feedback"):
+            parts.append(f"{counts['feedback']} отз.")
+        if counts.get("question"):
+            parts.append(f"{counts['question']} вопр.")
+        lines.append(f"   <i>{', '.join(parts)}</i>")
+    lines.append(f"✅ Отправлено через бота: <b>{answered}</b>")
 
     if u and u["wb_token"]:
         wb = WBClient(u["wb_token"])
         left = wb.cooldown_left()
         if left:
-            lines.append(f"⏳ WB на cooldown: ~{left // 60 + 1} мин")
+            lines.append("")
+            lines.append(f"⏳ WB на cooldown ещё ~{left // 60 + 1} мин")
+    if not u or not u["wb_token"]:
+        lines.append("")
+        lines.append("⚠️ Сначала задай WB-токен в «⚙️ Настройки»")
     return "\n".join(lines)
 
 
-async def _settings_text(db: DB, user_id: int) -> str:
+async def _build_kb(db: DB, user_id: int):
     u = await db.get_user(user_id)
-    if not u:
-        return "Настройки не найдены."
-    tone_label = dict(TONES).get(u["tone"], u["tone"])
-    style_label = dict(STYLES).get(u["style"], u["style"])
-    rating_label = dict(RATING_FILTERS).get(u["answer_rating"], u["answer_rating"])
-    return (
-        "<b>Текущие настройки:</b>\n"
-        f"• Тон: {html.escape(tone_label)}\n"
-        f"• Стиль: {html.escape(style_label)}\n"
-        f"• Фильтр оценок: {html.escape(rating_label)}\n"
-        f"• Подпись: <i>{html.escape(u['signature'] or '—')}</i>\n"
-        f"• WB-токен: {'задан ✅' if u['wb_token'] else 'не задан ❌'}\n"
-        f"• Автоответ: {'ВКЛ 🟢' if u['auto_enabled'] else 'ВЫКЛ ⚪️'}"
-    )
+    pending = await db.count_notified(user_id)
+    return main_menu(bool(u["wb_token"]), pending, bool(u["auto_send"]))
+
+
+async def _show_main(target, db: DB, user_id: int) -> None:
+    text = await _menu_text(db, user_id)
+    kb = await _build_kb(db, user_id)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # --------------------- /start ---------------------
 
 @router.message(Command("start"))
-async def cmd_start(msg: Message, db: DB, settings: Settings) -> None:
+async def cmd_start(msg: Message, db: DB) -> None:
     await db.ensure_user(msg.from_user.id)
-    u = await db.get_user(msg.from_user.id)
-    if not u["wb_token"]:
-        await msg.answer(
-            "👋 Привет! Я — бот-автоответчик отзывов Wildberries на базе Gemini.\n\n"
-            "Для начала задай WB-токен через кнопку ниже.",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-        )
-        return
-    await msg.answer(
-        await _menu_text(db, msg.from_user.id),
-        parse_mode="HTML",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-    )
+    await _show_main(msg, db, msg.from_user.id)
 
-
-# --------------------- Главное меню ---------------------
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(cq: CallbackQuery, db: DB, state: FSMContext) -> None:
     await state.clear()
+    await _show_main(cq, db, cq.from_user.id)
+    await cq.answer()
+
+
+# --------------------- Настройки ---------------------
+
+@router.callback_query(F.data == "menu:settings")
+async def cb_menu_settings(cq: CallbackQuery, db: DB) -> None:
     u = await db.get_user(cq.from_user.id)
+    pending = await db.count_notified(cq.from_user.id)
     await cq.message.edit_text(
-        await _menu_text(db, cq.from_user.id),
+        "⚙️ <b>Настройки</b>\n\nВыбери раздел:",
         parse_mode="HTML",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
+        reply_markup=settings_menu(bool(u["wb_token"]), pending),
     )
     await cq.answer()
 
 
 @router.callback_query(F.data == "show_settings")
 async def cb_show_settings(cq: CallbackQuery, db: DB) -> None:
-    text = await _settings_text(db, cq.from_user.id)
     u = await db.get_user(cq.from_user.id)
+    tone = dict(TONES).get(u["tone"], u["tone"])
+    style = dict(STYLES).get(u["style"], u["style"])
+    rating_label = dict(RATING_FILTERS).get(u["answer_rating"], u["answer_rating"])
+    pending = await db.count_notified(cq.from_user.id)
+    text = (
+        "ℹ️ <b>Текущие настройки:</b>\n\n"
+        f"🎭 Тон: {html.escape(tone)}\n"
+        f"🪶 Стиль: {html.escape(style)}\n"
+        f"🔍 Фильтр: {html.escape(rating_label)}\n"
+        f"✍️ Подпись: <i>{html.escape(u['signature'] or '—')}</i>\n"
+        f"🔑 WB-токен: {'задан ✅' if u['wb_token'] else 'не задан ❌'}\n"
+        f"⚡ Авто-отправка: {'ВКЛ' if u['auto_send'] else 'ВЫКЛ'}"
+    )
     await cq.message.edit_text(
-        text,
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
+        text, parse_mode="HTML",
+        reply_markup=settings_menu(bool(u["wb_token"]), pending),
     )
     await cq.answer()
 
 
-@router.callback_query(F.data == "toggle_auto")
-async def cb_toggle_auto(
-    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
-) -> None:
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
-        return
-    new_val = 0 if u["auto_enabled"] else 1
-    await db.update_field(cq.from_user.id, "auto_enabled", new_val)
-    u = await db.get_user(cq.from_user.id)
-    await cq.message.edit_reply_markup(
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"]))
-    )
-    if new_val:
-        await cq.answer("Авто-показ ВКЛЮЧЁН — проверяю отзывы сейчас...", show_alert=False)
-        from .scheduler import run_user_check
-        await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
-    else:
-        await cq.answer("Авто-показ выключен")
-
-
-@router.callback_query(F.data == "toggle_send")
-async def cb_toggle_send(cq: CallbackQuery, db: DB) -> None:
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
-        return
-    new_val = 0 if u["auto_send"] else 1
-    await db.update_field(cq.from_user.id, "auto_send", new_val)
-    u = await db.get_user(cq.from_user.id)
-    await cq.message.edit_reply_markup(
-        reply_markup=main_menu(
-            bool(u["auto_enabled"]), bool(u["wb_token"]),
-            await db.count_notified(u["user_id"]), bool(u["auto_send"]),
-        )
-    )
-    if new_val:
-        await cq.answer(
-            "⚡ Авто-отправка ВКЛЮЧЕНА.\n"
-            "Бот будет САМ отправлять ответы на WB без подтверждения. "
-            "Проверь настройки тона/стиля/фильтра!",
-            show_alert=True,
-        )
-    else:
-        await cq.answer("Авто-отправка выключена")
-
-
-# --------------------- Вопросы ---------------------
-
-# user_id -> {question_id: {"q": dict, "answer": str}}
-_question_cache: dict[int, dict[str, dict]] = {}
-
-
-def _format_question(q: dict, generated: str) -> str:
-    product = (q.get("productDetails") or {}).get("productName") or "—"
-    text = q.get("text") or "(без текста)"
-    return (
-        f"❓ <b>Новый вопрос</b>\n"
-        f"📦 <i>{html.escape(product)}</i>\n\n"
-        f"<b>Вопрос:</b>\n{html.escape(text)}\n\n"
-        f"<b>🤖 Ответ:</b>\n{html.escape(generated)}"
-    )
-
-
-async def _gen_question(gemini: GeminiClient, u: dict, q: dict) -> str:
-    try:
-        return await gemini.generate_question_answer(
-            question_text=q.get("text") or "",
-            product_name=(q.get("productDetails") or {}).get("productName"),
-            tone=u["tone"],
-            style=u["style"],
-            signature=u["signature"],
-        )
-    except GeminiError as e:
-        log.exception("Gemini error")
-        return f"[Ошибка генерации: {e}]"
-
-
-@router.callback_query(F.data == "show_questions")
-async def cb_show_questions(
-    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
-) -> None:
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
-        return
-    from .wb_api import WBClient
-    wb = WBClient(u["wb_token"])
-    if wb.cooldown_left() > 0:
-        await cq.answer(
-            f"WB на cooldown ~{wb.cooldown_left() // 60 + 1} мин",
-            show_alert=True,
-        )
-        return
-    await cq.answer("Загружаю вопросы...")
-    try:
-        questions = await wb.get_questions(take=settings.batch_size)
-    except WBError as e:
-        await cq.bot.send_message(cq.from_user.id, f"❌ {html.escape(str(e))}")
-        return
-    if not questions:
-        await cq.bot.send_message(cq.from_user.id, "📭 Новых вопросов нет.")
-        return
-
-    cache = _question_cache.setdefault(cq.from_user.id, {})
-    for q in questions:
-        ans = await _gen_question(gemini, u, q)
-        cache[q["id"]] = {"q": q, "answer": ans}
-        try:
-            await cq.bot.send_message(
-                cq.from_user.id,
-                _format_question(q, ans),
-                parse_mode="HTML",
-                reply_markup=question_kb(q["id"]),
-            )
-        except Exception:
-            log.exception("send question failed")
-
-
-@router.callback_query(F.data.startswith("qsend:"))
-async def cb_qsend(cq: CallbackQuery, db: DB) -> None:
-    qid = cq.data.split(":", 1)[1]
-    item = _question_cache.get(cq.from_user.id, {}).get(qid)
-    if not item:
-        await cq.answer("Вопрос не найден в сессии.", show_alert=True)
-        return
-    u = await db.get_user(cq.from_user.id)
-    from .wb_api import WBClient
-    wb = WBClient(u["wb_token"])
-    try:
-        await wb.answer_question(qid, item["answer"])
-    except WBError as e:
-        await cq.answer(f"Ошибка WB: {e}", show_alert=True)
-        return
-    _question_cache.get(cq.from_user.id, {}).pop(qid, None)
-    await cq.message.edit_text(
-        cq.message.html_text + "\n\n<b>✅ Ответ отправлен</b>",
-        parse_mode="HTML",
-    )
-    await cq.answer("Отправлено")
-
-
-@router.callback_query(F.data.startswith("qregen:"))
-async def cb_qregen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
-    qid = cq.data.split(":", 1)[1]
-    item = _question_cache.get(cq.from_user.id, {}).get(qid)
-    if not item:
-        await cq.answer("Вопрос не найден.", show_alert=True)
-        return
-    u = await db.get_user(cq.from_user.id)
-    await cq.answer("Перегенерирую...")
-    item["answer"] = await _gen_question(gemini, u, item["q"])
-    await cq.message.edit_text(
-        _format_question(item["q"], item["answer"]),
-        parse_mode="HTML",
-        reply_markup=question_kb(qid),
-    )
-
-
-@router.callback_query(F.data.startswith("qskip:"))
-async def cb_qskip(cq: CallbackQuery) -> None:
-    qid = cq.data.split(":", 1)[1]
-    _question_cache.get(cq.from_user.id, {}).pop(qid, None)
-    await cq.message.edit_text(
-        cq.message.html_text + "\n\n<b>⏭ Пропущено</b>",
-        parse_mode="HTML",
-    )
-    await cq.answer("Пропущено")
-
-
-@router.callback_query(F.data == "check_token")
-async def cb_check_token(cq: CallbackQuery, db: DB) -> None:
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Токен не задан.", show_alert=True)
-        return
-    await cq.answer("Проверяю...")
-    from .wb_api import WBClient
-    wb = WBClient(u["wb_token"])
-    status, msg = await wb.check()
-    icons = {
-        "ok": "✅",
-        "rate_limited": "⏳",
-        "unauthorized": "❌",
-        "network": "📡",
-        "error": "⚠️",
-    }
-    titles = {
-        "ok": "Токен валиден",
-        "rate_limited": "Токен валиден, но WB на cooldown",
-        "unauthorized": "Токен невалиден",
-        "network": "Сетевая ошибка",
-        "error": "Ошибка WB",
-    }
-    await cq.bot.send_message(
-        cq.from_user.id,
-        f"{icons.get(status, '❓')} <b>{titles.get(status, status)}</b>\n{html.escape(msg)}",
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data == "check_now")
-async def cb_check_now(
-    cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
-) -> None:
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
-        return
-    from .wb_api import WBClient
-    left = WBClient(u["wb_token"]).cooldown_left()
-    if left > 0:
-        await cq.answer(
-            f"WB на cooldown, осталось ~{left // 60 + 1} мин. Подожди — авто-цикл сам всё сделает.",
-            show_alert=True,
-        )
-        return
-    await cq.answer("Проверяю WB...", show_alert=False)
-    from .scheduler import run_user_check
-    stats = await run_user_check(cq.bot, db, gemini, settings, cq.from_user.id)
-
-    if stats.get("error"):
-        await cq.bot.send_message(
-            cq.from_user.id, f"⚠️ Ошибка: {html.escape(stats['error'])}"
-        )
-        return
-
-    if stats["pushed"] == 0:
-        rating_label = dict(RATING_FILTERS).get(u["answer_rating"], u["answer_rating"])
-        report = (
-            "📊 <b>Результат проверки WB:</b>\n"
-            f"• Неотвеченных в WB: <b>{stats['total']}</b>\n"
-            f"• Отрезано фильтром «{html.escape(rating_label)}»: {stats['filtered_out']}\n"
-            f"• Уже показывал ранее: {stats['already_seen']}\n"
-            f"• Новых для показа: <b>0</b>\n\n"
-        )
-        if stats["total"] == 0:
-            report += "В WB нет неотвеченных отзывов."
-        elif stats["already_seen"] > 0:
-            report += (
-                "Все отзывы уже показывались. Нажми <b>🗑 Сбросить историю показов</b>, "
-                "чтобы прислать их заново."
-            )
-        elif stats["filtered_out"] > 0:
-            report += "Все отрезал фильтр оценок. Поменяй его в меню."
-        await cq.bot.send_message(cq.from_user.id, report, parse_mode="HTML")
-
-
-@router.callback_query(F.data == "open_saved")
-async def cb_open_saved(cq: CallbackQuery, db: DB) -> None:
-    rows = await db.list_notified(cq.from_user.id)
-    if not rows:
-        await cq.answer("Сохранённых отзывов нет.", show_alert=True)
-        return
-    await cq.answer(f"Открываю {len(rows)}...")
-    for row in rows:
-        try:
-            fb = json.loads(row["fb_json"])
-        except Exception:
-            continue
-        try:
-            await cq.bot.send_message(
-                cq.from_user.id,
-                format_push(fb, row["answer"] or "(ответ не сохранён)"),
-                parse_mode="HTML",
-                reply_markup=push_feedback_kb(row["feedback_id"]),
-            )
-        except Exception:
-            log.exception("Не удалось отправить сохранённый отзыв")
-
-
-@router.callback_query(F.data == "reset_notified")
-async def cb_reset_notified(cq: CallbackQuery, db: DB) -> None:
-    import aiosqlite
-    async with aiosqlite.connect(db.path) as conn:
-        cur = await conn.execute(
-            "DELETE FROM notified WHERE user_id = ?", (cq.from_user.id,)
-        )
-        await conn.commit()
-        deleted = cur.rowcount
-    await cq.answer(f"Сброшено: {deleted}", show_alert=True)
-
-
-# --------------------- Выбор тона / стиля / фильтра ---------------------
+# --------------------- Тон / Стиль / Фильтр ---------------------
 
 @router.callback_query(F.data == "menu:tone")
 async def cb_menu_tone(cq: CallbackQuery, db: DB) -> None:
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_text(
-        "🎭 Выберите тон ответа:", reply_markup=tone_kb(u["tone"])
+        "🎭 Выбери тон ответа:", reply_markup=tone_kb(u["tone"])
     )
     await cq.answer()
 
@@ -493,7 +220,7 @@ async def cb_menu_tone(cq: CallbackQuery, db: DB) -> None:
 async def cb_menu_style(cq: CallbackQuery, db: DB) -> None:
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_text(
-        "🪶 Выберите стиль ответа:", reply_markup=style_kb(u["style"])
+        "🪶 Выбери стиль ответа:", reply_markup=style_kb(u["style"])
     )
     await cq.answer()
 
@@ -502,8 +229,7 @@ async def cb_menu_style(cq: CallbackQuery, db: DB) -> None:
 async def cb_menu_rating(cq: CallbackQuery, db: DB) -> None:
     u = await db.get_user(cq.from_user.id)
     await cq.message.edit_text(
-        "🔍 На какие отзывы отвечать?",
-        reply_markup=rating_kb(u["answer_rating"]),
+        "🔍 На какие отзывы отвечать?", reply_markup=rating_kb(u["answer_rating"])
     )
     await cq.answer()
 
@@ -532,56 +258,74 @@ async def cb_set_rating(cq: CallbackQuery, db: DB) -> None:
     await cq.answer(f"Фильтр: {dict(RATING_FILTERS).get(code, code)}")
 
 
-# --------------------- Ввод токена ---------------------
+# --------------------- Токен ---------------------
 
 @router.callback_query(F.data == "set_token")
 async def cb_set_token(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TokenInput.waiting)
     await cq.message.edit_text(
-        "🔑 Пришлите WB API-токен (категория «Отзывы и вопросы»).\n\n"
-        "Получить: <b>Настройки → Доступ к API</b> в личном кабинете продавца.",
+        "🔑 Пришли WB API-токен (категория «Отзывы и вопросы»).\n\n"
+        "<b>Где взять:</b> ЛК продавца → Настройки → Доступ к API → Создать токен.",
+        parse_mode="HTML",
         reply_markup=cancel_kb(),
     )
     await cq.answer()
 
 
 @router.message(TokenInput.waiting)
-async def msg_token(msg: Message, state: FSMContext, db: DB, settings: Settings) -> None:
+async def msg_token(msg: Message, state: FSMContext, db: DB) -> None:
     token = (msg.text or "").strip()
     try:
-        await msg.delete()  # чтобы токен не висел в чате
+        await msg.delete()
     except Exception:
-        log.info("Не удалось удалить сообщение с токеном (нет прав)")
+        pass
     if len(token) < 20:
-        await msg.answer("❌ Похоже, это не токен. Попробуйте ещё раз.",
+        await msg.answer("❌ Похоже, это не токен. Попробуй ещё раз.",
                          reply_markup=cancel_kb())
         return
-
-    wb = WBClient(token)
-    ok = await wb.ping()
-    if not ok:
-        await msg.answer("❌ Токен не прошёл проверку у WB. Попробуйте другой.",
-                         reply_markup=cancel_kb())
-        return
-
     await db.update_field(msg.from_user.id, "wb_token", token)
     await state.clear()
-    u = await db.get_user(msg.from_user.id)
     await msg.answer(
-        "✅ Токен сохранён и проверен.",
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
+        "✅ Токен сохранён. Жми «🔬 Проверить токен» чтобы убедиться, что он валиден."
+    )
+    await _show_main(msg, db, msg.from_user.id)
+
+
+@router.callback_query(F.data == "check_token")
+async def cb_check_token(cq: CallbackQuery, db: DB) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Токен не задан.", show_alert=True)
+        return
+    await cq.answer("Проверяю...")
+    wb = WBClient(u["wb_token"])
+    status, info = await wb.check()
+    icons = {"ok": "✅", "rate_limited": "⏳", "unauthorized": "❌",
+             "network": "📡", "error": "⚠️"}
+    titles = {
+        "ok": "Токен валиден",
+        "rate_limited": "Токен валиден, но WB на cooldown",
+        "unauthorized": "Токен невалиден",
+        "network": "Сетевая ошибка",
+        "error": "Ошибка WB",
+    }
+    await cq.bot.send_message(
+        cq.from_user.id,
+        f"{icons.get(status, '❓')} <b>{titles.get(status, status)}</b>\n{html.escape(info)}",
+        parse_mode="HTML",
     )
 
 
-# --------------------- Ввод подписи ---------------------
+# --------------------- Подпись ---------------------
 
 @router.callback_query(F.data == "set_signature")
 async def cb_set_signature(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SignatureInput.waiting)
     await cq.message.edit_text(
-        "✍️ Пришлите подпись магазина (она будет добавляться в конец ответов).\n"
+        "✍️ Пришли подпись магазина (добавится в конец ответов).\n"
         "Например: <i>«С уважением, команда Магазина»</i>\n\n"
-        "Отправьте «-» чтобы убрать подпись.",
+        "Отправь «-» чтобы убрать подпись.",
+        parse_mode="HTML",
         reply_markup=cancel_kb(),
     )
     await cq.answer()
@@ -593,220 +337,290 @@ async def msg_signature(msg: Message, state: FSMContext, db: DB) -> None:
     value = None if sig == "-" else sig[:200]
     await db.update_field(msg.from_user.id, "signature", value)
     await state.clear()
-    u = await db.get_user(msg.from_user.id)
-    await msg.answer(
-        "✅ Подпись " + ("удалена." if value is None else "сохранена."),
-        reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
+    await msg.answer("✅ Подпись " + ("удалена." if value is None else "сохранена."))
+    await _show_main(msg, db, msg.from_user.id)
+
+
+# --------------------- Авто-отправка ---------------------
+
+@router.callback_query(F.data == "toggle_send")
+async def cb_toggle_send(cq: CallbackQuery, db: DB) -> None:
+    u = await db.get_user(cq.from_user.id)
+    if not u["wb_token"]:
+        await cq.answer("Сначала задай WB-токен.", show_alert=True)
+        return
+    new_val = 0 if u["auto_send"] else 1
+    await db.update_field(cq.from_user.id, "auto_send", new_val)
+    await _show_main(cq, db, cq.from_user.id)
+    if new_val:
+        await cq.answer(
+            "⚡ Авто-отправка ВКЛЮЧЕНА. После каждого «Обновить» бот будет САМ "
+            "отправлять ответы из буфера на WB. Проверь тон/подпись!",
+            show_alert=True,
+        )
+    else:
+        await cq.answer("Авто-отправка выключена")
+
+
+# --------------------- Обновление с WB ---------------------
+
+async def _gen_feedback_answer(gemini: GeminiClient, u: dict, fb: dict) -> str:
+    return await gemini.generate_answer(
+        review_text=fb.get("text") or "",
+        rating=fb.get("productValuation") or 5,
+        product_name=(fb.get("productDetails") or {}).get("productName"),
+        tone=u["tone"], style=u["style"], signature=u["signature"],
     )
 
 
-# --------------------- Показ отзывов ---------------------
+async def _gen_question_answer(gemini: GeminiClient, u: dict, q: dict) -> str:
+    return await gemini.generate_question_answer(
+        question_text=q.get("text") or "",
+        product_name=(q.get("productDetails") or {}).get("productName"),
+        tone=u["tone"], style=u["style"], signature=u["signature"],
+    )
 
-@router.callback_query(F.data.startswith("show:"))
-async def cb_show(
+
+async def _process_items(
+    db: DB, gemini: GeminiClient, u: dict, items: list[dict], kind: str
+) -> int:
+    """Сгенерить ответы и сохранить в буфер. Возвращает число добавленных."""
+    user_id = u["user_id"]
+    added = 0
+    for item in items:
+        iid = item["id"]
+        if await db.is_answered(user_id, iid) or await db.is_notified(user_id, iid):
+            continue
+        try:
+            if kind == "feedback":
+                ans = await _gen_feedback_answer(gemini, u, item)
+            else:
+                ans = await _gen_question_answer(gemini, u, item)
+        except GeminiError as e:
+            log.warning("Gemini failed: %s", e)
+            ans = f"[Ошибка генерации: {e}]"
+        await db.add_notified(user_id, iid, ans, json.dumps(item, ensure_ascii=False), kind)
+        added += 1
+    return added
+
+
+async def _auto_send_buffer(db: DB, wb: WBClient, user_id: int) -> tuple[int, str | None]:
+    """Отправить всё из буфера на WB. (sent, error_msg)."""
+    rows = await db.list_notified(user_id)
+    sent = 0
+    for r in rows:
+        try:
+            if r["kind"] == "question":
+                await wb.answer_question(r["feedback_id"], r["answer"])
+            else:
+                await wb.answer(r["feedback_id"], r["answer"])
+        except WBRateLimited as e:
+            return sent, f"WB лимит: {e}"
+        except WBError as e:
+            log.warning("WB send failed: %s", e)
+            continue
+        await db.mark_answered(user_id, r["feedback_id"])
+        await db.delete_notified(user_id, r["feedback_id"])
+        sent += 1
+        await asyncio.sleep(1.5)
+    return sent, None
+
+
+@router.callback_query(F.data == "refresh")
+async def cb_refresh(
     cq: CallbackQuery, db: DB, gemini: GeminiClient, settings: Settings
 ) -> None:
-    idx = int(cq.data.split(":", 1)[1])
     u = await db.get_user(cq.from_user.id)
     if not u["wb_token"]:
-        await cq.answer("Сначала задайте WB-токен.", show_alert=True)
+        await cq.answer("Сначала задай WB-токен.", show_alert=True)
         return
-
-    cache = _session_cache.get(cq.from_user.id)
-    if not cache or idx == 0:
-        await cq.message.edit_text("⏳ Загружаю отзывы из WB...")
-        try:
-            wb = WBClient(u["wb_token"])
-            raw = await wb.get_unanswered(take=settings.batch_size)
-        except WBError as e:
-            log.exception("WB error")
-            await cq.message.edit_text(
-                f"❌ Ошибка WB API: {html.escape(str(e))}",
-                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-            )
-            return
-        filtered = _filter_by_rating(raw, u["answer_rating"])
-        if not filtered:
-            await cq.message.edit_text(
-                "📭 Неотвеченных отзывов нет.",
-                reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-            )
-            return
-        cache = [{"fb": fb, "answer": None} for fb in filtered]
-        _session_cache[cq.from_user.id] = cache
-
-    if idx >= len(cache):
-        await cq.answer("Это был последний отзыв.", show_alert=True)
-        return
-
-    item = cache[idx]
-    if not item["answer"]:
-        await cq.message.edit_text(f"🤖 Генерирую ответ ({idx + 1}/{len(cache)})...")
-        item["answer"] = await _gen(gemini, u, item["fb"])
-
-    await cq.message.edit_text(
-        _format_feedback(item["fb"], item["answer"], idx, len(cache)),
-        parse_mode="HTML",
-        reply_markup=feedback_kb(item["fb"]["id"], idx, len(cache)),
-    )
-    await cq.answer()
-
-
-async def _gen(gemini: GeminiClient, user: dict, fb: dict) -> str:
-    try:
-        return await gemini.generate_answer(
-            review_text=fb.get("text") or "",
-            rating=fb.get("productValuation") or 5,
-            product_name=(fb.get("productDetails") or {}).get("productName"),
-            tone=user["tone"],
-            style=user["style"],
-            signature=user["signature"],
+    wb = WBClient(u["wb_token"])
+    left = wb.cooldown_left()
+    if left > 0:
+        await cq.answer(
+            f"WB на cooldown ещё ~{left // 60 + 1} мин. Подожди.",
+            show_alert=True,
         )
-    except GeminiError as e:
-        log.exception("Gemini error")
-        return f"[Ошибка генерации: {e}]"
-
-
-@router.callback_query(F.data.startswith("regen:"))
-async def cb_regen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
-    fb_id = cq.data.split(":", 1)[1]
-    cache = _session_cache.get(cq.from_user.id) or []
-    idx, item = next(
-        ((i, it) for i, it in enumerate(cache) if it["fb"]["id"] == fb_id),
-        (None, None),
-    )
-    if item is None:
-        await cq.answer("Отзыв не найден в текущей сессии.", show_alert=True)
         return
-    await cq.answer("Перегенерирую...")
-    u = await db.get_user(cq.from_user.id)
-    item["answer"] = await _gen(gemini, u, item["fb"])
-    await cq.message.edit_text(
-        _format_feedback(item["fb"], item["answer"], idx, len(cache)),
-        parse_mode="HTML",
-        reply_markup=feedback_kb(item["fb"]["id"], idx, len(cache)),
+
+    await cq.answer("Обновляю...")
+    progress = await cq.bot.send_message(
+        cq.from_user.id, "⏳ Загружаю отзывы с WB..."
     )
 
+    # 1. Отзывы
+    f_count = 0
+    f_added = 0
+    f_err: str | None = None
+    try:
+        feedbacks = await wb.get_unanswered(take=settings.batch_size)
+        f_count = len(feedbacks)
+        feedbacks = _filter_by_rating(feedbacks, u["answer_rating"])
+        await progress.edit_text(
+            f"⏳ Отзывов получено: {f_count}, генерирую ответы..."
+        )
+        f_added = await _process_items(db, gemini, u, feedbacks, "feedback")
+    except WBRateLimited as e:
+        f_err = f"лимит ({e})"
+    except WBError as e:
+        f_err = str(e)
+
+    # Пауза между WB-вызовами
+    await progress.edit_text("⏳ Загружаю вопросы с WB...")
+    await asyncio.sleep(5)
+
+    # 2. Вопросы
+    q_count = 0
+    q_added = 0
+    q_err: str | None = None
+    left = wb.cooldown_left()
+    if left > 0:
+        q_err = "WB cooldown после отзывов"
+    else:
+        try:
+            questions = await wb.get_questions(take=settings.batch_size)
+            q_count = len(questions)
+            q_added = await _process_items(db, gemini, u, questions, "question")
+        except WBRateLimited as e:
+            q_err = f"лимит ({e})"
+        except WBError as e:
+            q_err = str(e)
+
+    # Сохраняем cache счётчиков
+    last_check[cq.from_user.id] = {
+        "feedbacks": f_count if f_err is None else last_check.get(cq.from_user.id, {}).get("feedbacks", "?"),
+        "questions": q_count if q_err is None else last_check.get(cq.from_user.id, {}).get("questions", "?"),
+        "ts": datetime.now(timezone.utc),
+    }
+
+    # Сводка
+    summary_lines = ["📊 <b>Готово</b>"]
+    if f_err:
+        summary_lines.append(f"📬 Отзывы: ❌ {html.escape(f_err)}")
+    else:
+        summary_lines.append(f"📬 Отзывы: {f_count} в WB, {f_added} новых в буфер")
+    if q_err:
+        summary_lines.append(f"❓ Вопросы: ❌ {html.escape(q_err)}")
+    else:
+        summary_lines.append(f"❓ Вопросы: {q_count} в WB, {q_added} новых в буфер")
+
+    # Авто-отправка
+    if u["auto_send"] and (f_added or q_added or await db.count_notified(cq.from_user.id)):
+        sent, send_err = await _auto_send_buffer(db, wb, cq.from_user.id)
+        summary_lines.append(f"⚡ Отправлено на WB: {sent}")
+        if send_err:
+            summary_lines.append(f"   <i>{html.escape(send_err)}</i>")
+
+    pending = await db.count_notified(cq.from_user.id)
+    if pending and not u["auto_send"]:
+        summary_lines.append(f"\n📂 В буфере: <b>{pending}</b>. Жми «Открыть буфер».")
+
+    await progress.edit_text("\n".join(summary_lines), parse_mode="HTML")
+    await _show_main(cq, db, cq.from_user.id)
+
+
+# --------------------- Открыть буфер ---------------------
+
+@router.callback_query(F.data == "open_buffer")
+async def cb_open_buffer(cq: CallbackQuery, db: DB) -> None:
+    rows = await db.list_notified(cq.from_user.id)
+    if not rows:
+        await cq.answer("Буфер пуст.", show_alert=True)
+        return
+    await cq.answer(f"Открываю {len(rows)}...")
+    for r in rows:
+        try:
+            item = json.loads(r["fb_json"])
+        except Exception:
+            continue
+        try:
+            await cq.bot.send_message(
+                cq.from_user.id,
+                _format_item(item, r["answer"] or "(не сгенерирован)", r["kind"]),
+                parse_mode="HTML",
+                reply_markup=buffer_item_kb(r["kind"], r["feedback_id"]),
+            )
+        except Exception:
+            log.exception("send buffer item failed")
+
+
+# --------------------- Очистка буфера ---------------------
+
+@router.callback_query(F.data == "clear_buffer")
+async def cb_clear_buffer(cq: CallbackQuery, db: DB) -> None:
+    deleted = await db.clear_notified(cq.from_user.id)
+    await cq.answer(f"Удалено из буфера: {deleted}", show_alert=True)
+    u = await db.get_user(cq.from_user.id)
+    pending = await db.count_notified(cq.from_user.id)
+    await cq.message.edit_reply_markup(
+        reply_markup=settings_menu(bool(u["wb_token"]), pending)
+    )
+
+
+# --------------------- Действия с элементом буфера ---------------------
 
 @router.callback_query(F.data.startswith("send:"))
-async def cb_send(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
-    fb_id = cq.data.split(":", 1)[1]
-    cache = _session_cache.get(cq.from_user.id) or []
-    idx, item = next(
-        ((i, it) for i, it in enumerate(cache) if it["fb"]["id"] == fb_id),
-        (None, None),
-    )
-    if item is None:
-        await cq.answer("Отзыв не найден в текущей сессии.", show_alert=True)
+async def cb_send(cq: CallbackQuery, db: DB) -> None:
+    _, kind, item_id = cq.data.split(":", 2)
+    row = await db.get_notified(cq.from_user.id, item_id)
+    if not row:
+        await cq.answer("Элемент уже обработан.", show_alert=True)
         return
-
     u = await db.get_user(cq.from_user.id)
     wb = WBClient(u["wb_token"])
     try:
-        await wb.answer(fb_id, item["answer"])
+        if kind == "question":
+            await wb.answer_question(item_id, row["answer"])
+        else:
+            await wb.answer(item_id, row["answer"])
+    except WBRateLimited as e:
+        await cq.answer(f"WB лимит: {e}", show_alert=True)
+        return
     except WBError as e:
         await cq.answer(f"Ошибка WB: {e}", show_alert=True)
         return
-
-    await db.mark_answered(cq.from_user.id, fb_id)
-    await cq.answer("✅ Ответ отправлен на WB")
-
-    if idx + 1 < len(cache):
-        await _open_idx(cq, db, gemini, idx + 1)
-    else:
-        await cq.message.edit_text(
-            "🎉 Все отзывы из текущей пачки обработаны.",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-        )
-        _session_cache.pop(cq.from_user.id, None)
-
-
-@router.callback_query(F.data.startswith("skip:"))
-async def cb_skip(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
-    idx = int(cq.data.split(":", 1)[1])
-    cache = _session_cache.get(cq.from_user.id) or []
-    if idx + 1 >= len(cache):
-        await cq.answer("Это был последний отзыв.", show_alert=True)
-        u = await db.get_user(cq.from_user.id)
-        await cq.message.edit_text(
-            "🏠 Главное меню",
-            reply_markup=main_menu(bool(u["auto_enabled"]), bool(u["wb_token"]), await db.count_notified(u["user_id"]), bool(u["auto_send"])),
-        )
-        _session_cache.pop(cq.from_user.id, None)
-        return
-    await _open_idx(cq, db, gemini, idx + 1)
-
-
-# --------------------- Авто-показ: действия по кнопкам в пуш-сообщении ---------------------
-
-@router.callback_query(F.data.startswith("psend:"))
-async def cb_push_send(cq: CallbackQuery, db: DB) -> None:
-    fb_id = cq.data.split(":", 1)[1]
-    row = await db.get_notified(cq.from_user.id, fb_id)
-    if not row or not row["answer"]:
-        await cq.answer("Отзыв уже обработан или ответ не сгенерирован.", show_alert=True)
-        return
-    u = await db.get_user(cq.from_user.id)
-    if not u["wb_token"]:
-        await cq.answer("Нет WB-токена.", show_alert=True)
-        return
-    wb = WBClient(u["wb_token"])
-    try:
-        await wb.answer(fb_id, row["answer"])
-    except WBError as e:
-        await cq.answer(f"Ошибка WB: {e}", show_alert=True)
-        return
-    await db.mark_answered(cq.from_user.id, fb_id)
-    await db.delete_notified(cq.from_user.id, fb_id)
+    await db.mark_answered(cq.from_user.id, item_id)
+    await db.delete_notified(cq.from_user.id, item_id)
     await cq.message.edit_text(
-        cq.message.html_text + "\n\n<b>✅ Ответ отправлен на WB</b>",
+        cq.message.html_text + "\n\n<b>✅ Ответ отправлен</b>",
         parse_mode="HTML",
     )
     await cq.answer("Отправлено")
 
 
-@router.callback_query(F.data.startswith("pregen:"))
-async def cb_push_regen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
-    fb_id = cq.data.split(":", 1)[1]
-    row = await db.get_notified(cq.from_user.id, fb_id)
+@router.callback_query(F.data.startswith("regen:"))
+async def cb_regen(cq: CallbackQuery, db: DB, gemini: GeminiClient) -> None:
+    _, kind, item_id = cq.data.split(":", 2)
+    row = await db.get_notified(cq.from_user.id, item_id)
     if not row:
-        await cq.answer("Отзыв не найден.", show_alert=True)
+        await cq.answer("Элемент не найден.", show_alert=True)
         return
-    fb = json.loads(row["fb_json"])
+    item = json.loads(row["fb_json"])
     u = await db.get_user(cq.from_user.id)
     await cq.answer("Перегенерирую...")
-    new_answer = await _gen(gemini, u, fb)
-    await db.update_notified_answer(cq.from_user.id, fb_id, new_answer)
+    try:
+        if kind == "question":
+            ans = await _gen_question_answer(gemini, u, item)
+        else:
+            ans = await _gen_feedback_answer(gemini, u, item)
+    except GeminiError as e:
+        await cq.bot.send_message(cq.from_user.id, f"⚠️ Gemini: {e}")
+        return
+    await db.update_notified_answer(cq.from_user.id, item_id, ans)
     await cq.message.edit_text(
-        format_push(fb, new_answer),
+        _format_item(item, ans, kind),
         parse_mode="HTML",
-        reply_markup=push_feedback_kb(fb_id),
+        reply_markup=buffer_item_kb(kind, item_id),
     )
 
 
-@router.callback_query(F.data.startswith("pskip:"))
-async def cb_push_skip(cq: CallbackQuery, db: DB) -> None:
-    fb_id = cq.data.split(":", 1)[1]
-    await db.mark_answered(cq.from_user.id, fb_id)  # чтобы больше не присылал
-    await db.delete_notified(cq.from_user.id, fb_id)
+@router.callback_query(F.data.startswith("skip:"))
+async def cb_skip(cq: CallbackQuery, db: DB) -> None:
+    _, kind, item_id = cq.data.split(":", 2)
+    await db.mark_answered(cq.from_user.id, item_id)
+    await db.delete_notified(cq.from_user.id, item_id)
     await cq.message.edit_text(
         cq.message.html_text + "\n\n<b>⏭ Пропущено</b>",
         parse_mode="HTML",
     )
     await cq.answer("Пропущено")
-
-
-async def _open_idx(cq: CallbackQuery, db: DB, gemini: GeminiClient, idx: int) -> None:
-    cache = _session_cache.get(cq.from_user.id) or []
-    if idx >= len(cache):
-        return
-    item = cache[idx]
-    if not item["answer"]:
-        await cq.message.edit_text(f"🤖 Генерирую ответ ({idx + 1}/{len(cache)})...")
-        u = await db.get_user(cq.from_user.id)
-        item["answer"] = await _gen(gemini, u, item["fb"])
-    await cq.message.edit_text(
-        _format_feedback(item["fb"], item["answer"], idx, len(cache)),
-        parse_mode="HTML",
-        reply_markup=feedback_kb(item["fb"]["id"], idx, len(cache)),
-    )

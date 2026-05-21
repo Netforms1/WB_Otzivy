@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS notified (
     feedback_id TEXT NOT NULL,
     answer      TEXT,
     fb_json     TEXT,
+    kind        TEXT NOT NULL DEFAULT 'feedback',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, feedback_id)
 );
@@ -44,6 +45,12 @@ class DB:
             try:
                 await db.execute(
                     "ALTER TABLE users ADD COLUMN auto_send INTEGER NOT NULL DEFAULT 0"
+                )
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute(
+                    "ALTER TABLE notified ADD COLUMN kind TEXT NOT NULL DEFAULT 'feedback'"
                 )
             except aiosqlite.OperationalError:
                 pass
@@ -110,15 +117,28 @@ class DB:
             return await cur.fetchone() is not None
 
     async def add_notified(
-        self, user_id: int, feedback_id: str, answer: str, fb_json: str
+        self,
+        user_id: int,
+        feedback_id: str,
+        answer: str,
+        fb_json: str,
+        kind: str = "feedback",
     ) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO notified(user_id, feedback_id, answer, fb_json)"
-                " VALUES (?, ?, ?, ?)",
-                (user_id, feedback_id, answer, fb_json),
+                "INSERT OR REPLACE INTO notified(user_id, feedback_id, answer, fb_json, kind)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (user_id, feedback_id, answer, fb_json, kind),
             )
             await db.commit()
+
+    async def clear_notified(self, user_id: int) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "DELETE FROM notified WHERE user_id = ?", (user_id,)
+            )
+            await db.commit()
+            return cur.rowcount
 
     async def get_notified(self, user_id: int, feedback_id: str) -> dict | None:
         async with aiosqlite.connect(self.path) as db:
@@ -162,11 +182,19 @@ class DB:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT feedback_id, answer, fb_json FROM notified"
+                "SELECT feedback_id, answer, fb_json, kind FROM notified"
                 " WHERE user_id = ? ORDER BY created_at DESC",
                 (user_id,),
             )
             return [dict(r) for r in await cur.fetchall()]
+
+    async def count_notified_by_kind(self, user_id: int) -> dict:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT kind, COUNT(*) FROM notified WHERE user_id = ? GROUP BY kind",
+                (user_id,),
+            )
+            return {r[0]: r[1] for r in await cur.fetchall()}
 
     async def delete_notified(self, user_id: int, feedback_id: str) -> None:
         async with aiosqlite.connect(self.path) as db:
