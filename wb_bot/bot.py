@@ -39,7 +39,13 @@ async def main() -> None:
     sched.start()
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        for attempt in range(3):
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                break
+            except Exception as e:
+                logging.warning("delete_webhook fail (%d/3): %s", attempt + 1, e)
+                await asyncio.sleep(2 * (attempt + 1))
         await dp.start_polling(bot)
     finally:
         sched.shutdown(wait=False)
