@@ -50,8 +50,11 @@ class OzonClient:
 
     async def _post(self, path: str, body: dict) -> httpx.Response:
         self._check_cooldown()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(f"{BASE_URL}{path}", headers=self._headers(), json=body)
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(f"{BASE_URL}{path}", headers=self._headers(), json=body)
+        except httpx.RequestError as e:
+            raise OzonError(f"Сетевая ошибка: {e.__class__.__name__}") from e
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
             try:

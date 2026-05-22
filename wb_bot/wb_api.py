@@ -44,10 +44,13 @@ class WBClient:
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         self._check_cooldown()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.request(
-                method, f"{BASE_URL}{path}", headers=self._headers(), **kwargs
-            )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.request(
+                    method, f"{BASE_URL}{path}", headers=self._headers(), **kwargs
+                )
+        except httpx.RequestError as e:
+            raise WBError(f"Сетевая ошибка: {e.__class__.__name__}") from e
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
             try:

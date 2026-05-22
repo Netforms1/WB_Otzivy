@@ -108,11 +108,14 @@ class GeminiClient:
                 "maxOutputTokens": 800,
             },
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, params={"key": self.api_key}, json=payload)
-            if r.status_code != 200:
-                raise GeminiError(f"Gemini {r.status_code}: {r.text}")
-            data = r.json()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(url, params={"key": self.api_key}, json=payload)
+        except httpx.RequestError as e:
+            raise GeminiError(f"Сетевая ошибка: {e.__class__.__name__}") from e
+        if r.status_code != 200:
+            raise GeminiError(f"Gemini {r.status_code}: {r.text[:300]}")
+        data = r.json()
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError, TypeError) as e:
